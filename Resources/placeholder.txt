@@ -1,0 +1,1 @@
+AppLogo.png will be injected by build_h5shell.py after compilation.
