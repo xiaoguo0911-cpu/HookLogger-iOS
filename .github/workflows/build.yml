@@ -1,0 +1,155 @@
+name: Build H5Shell IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      h5_url:
+        description: 'H5 URL'
+        required: true
+        default: 'https://example.com'
+      display_name:
+        description: 'App Display Name'
+        required: true
+        default: 'H5Shell'
+      bundle_id:
+        description: 'Bundle ID'
+        required: false
+        default: 'com.h5shell.app'
+      splash_r:
+        description: 'Splash BG Red (0-255)'
+        required: false
+        default: '26'
+      splash_g:
+        description: 'Splash BG Green (0-255)'
+        required: false
+        default: '30'
+      splash_b:
+        description: 'Splash BG Blue (0-255)'
+        required: false
+        default: '46'
+      splash_duration:
+        description: 'Splash duration seconds'
+        required: false
+        default: '10'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Patch Info.plist values
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+
+          # patch project.yml
+          with open('project.yml', 'r') as f:
+              yml = f.read()
+
+          url  = '${{ github.event.inputs.h5_url }}'
+          name = '${{ github.event.inputs.display_name }}'
+          bid  = '${{ github.event.inputs.bundle_id }}'
+
+          if not url.startswith('http'):
+              url = 'https://' + url
+
+          yml = re.sub(r'H5BaseURL:.*', f'H5BaseURL: "{url}"', yml)
+          yml = re.sub(r'CFBundleDisplayName:.*', f'CFBundleDisplayName: {name}', yml)
+          yml = re.sub(r'CFBundleName:.*', f'CFBundleName: {name}', yml)
+          if bid:
+              yml = re.sub(r'CFBundleIdentifier:.*', f'CFBundleIdentifier: {bid}', yml)
+
+          # Splash color + duration
+          r_val = '${{ github.event.inputs.splash_r }}' or '26'
+          g_val = '${{ github.event.inputs.splash_g }}' or '30'
+          b_val = '${{ github.event.inputs.splash_b }}' or '46'
+          dur   = '${{ github.event.inputs.splash_duration }}' or '10'
+          for key, val in [('SplashBgR', r_val), ('SplashBgG', g_val),
+                           ('SplashBgB', b_val), ('SplashDuration', dur)]:
+              if key in yml:
+                  yml = re.sub(rf'{key}:.*', f'{key}: {val}', yml)
+              else:
+                  yml = yml.rstrip() + f'\n        {key}: {val}\n'
+
+          with open('project.yml', 'w') as f:
+              f.write(yml)
+          print('project.yml patched')
+          EOF
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for iOS device
+        run: |
+          set -eo pipefail
+          xcodebuild \
+            -project H5Shell.xcodeproj \
+            -scheme H5Shell \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENABLE_BITCODE=NO \
+            clean build 2>&1 | tee build.log
+
+          echo "--- xcodebuild exit: $?"
+
+          # Find the built .app
+          APP=$(find ~/Library/Developer/Xcode/DerivedData -name "H5Shell.app" \
+                     -path "*/Release-iphoneos/*" 2>/dev/null | head -1)
+          if [ -z "$APP" ]; then
+            APP=$(find . -name "H5Shell.app" -path "*/Release-iphoneos/*" | head -1)
+          fi
+          if [ -z "$APP" ]; then
+            echo "ERROR: H5Shell.app not found after build"
+            echo "--- Last 50 lines of build log ---"
+            tail -50 build.log
+            exit 1
+          fi
+          # Verify the binary exists inside the app
+          if [ ! -f "$APP/H5Shell" ]; then
+            echo "ERROR: H5Shell binary missing inside $APP"
+            ls -la "$APP/"
+            exit 1
+          fi
+          echo "APP=$APP" >> $GITHUB_ENV
+          echo "Found: $APP (binary OK)"
+
+      - name: Install ldid
+        run: |
+          brew install ldid 2>/dev/null || true
+          which ldid && ldid --version || echo "ldid from brew"
+
+      - name: Sign and package IPA
+        run: |
+          APP="${{ env.APP }}"
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "ERROR: APP path is empty or missing: '$APP'"
+            exit 1
+          fi
+          echo "Signing: $APP"
+
+          # Sign main binary
+          ldid -S "$APP/H5Shell" || echo "sign failed, continuing"
+
+          # Create IPA
+          rm -rf _ipa_work
+          mkdir -p _ipa_work/Payload
+          cp -r "$APP" _ipa_work/Payload/
+          ls -lh _ipa_work/Payload/
+          cd _ipa_work
+          zip -qr ../H5Shell.ipa Payload
+          cd ..
+          ls -lh H5Shell.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: H5Shell-IPA
+          path: H5Shell.ipa
+          retention-days: 7
