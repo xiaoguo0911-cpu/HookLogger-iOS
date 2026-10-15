@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: com.h5shell
   deploymentTarget:
     iOS: "15.0"
+  xcodeVersion: "15"
 
 settings:
   SWIFT_VERSION: "5.9"
