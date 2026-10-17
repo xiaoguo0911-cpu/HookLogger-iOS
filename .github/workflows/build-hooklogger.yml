@@ -1,0 +1,24 @@
+name: Build HookLogger dylib
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'HookLogger.m'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build HookLogger.dylib
+        run: |
+          SDK=
+          xcrun --sdk iphoneos clang             -dynamiclib -arch arm64 -fobjc-arc             -framework Foundation             -miphoneos-version-min=14.0             -isysroot              -install_name @rpath/HookLogger.dylib             -o HookLogger.dylib             HookLogger.m
+          brew install ldid 2>/dev/null || true
+          ldid -S HookLogger.dylib
+          ls -lh HookLogger.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HookLogger-dylib
+          path: HookLogger.dylib
