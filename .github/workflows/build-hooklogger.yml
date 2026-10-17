@@ -8,8 +8,24 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build
-        run: xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -fobjc-arc -framework Foundation -miphoneos-version-min=14.0 -isysroot  -o HookLogger.dylib HookLogger.m && brew install ldid 2>/dev/null || true && ldid -S HookLogger.dylib && ls -lh HookLogger.dylib
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer 2>/dev/null ||           sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer 2>/dev/null ||           sudo xcode-select -s /Contents/Developer
+          xcodebuild -version
+
+      - name: Build HookLogger.dylib
+        run: |
+          SDK=
+          echo "SDK: "
+          clang -dynamiclib -arch arm64 -fobjc-arc             -framework Foundation             -miphoneos-version-min=14.0             -isysroot ""             -o HookLogger.dylib             HookLogger.m
+          ls -lh HookLogger.dylib
+
+      - name: Sign with ldid
+        run: |
+          brew install ldid 2>/dev/null || true
+          ldid -S HookLogger.dylib
+
       - uses: actions/upload-artifact@v4
         with:
           name: HookLogger-dylib
