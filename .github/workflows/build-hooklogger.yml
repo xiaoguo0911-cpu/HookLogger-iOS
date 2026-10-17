@@ -2,21 +2,14 @@ name: Build HookLogger dylib
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'HookLogger.m'
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build HookLogger.dylib
-        run: |
-          xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -fobjc-arc -framework Foundation -miphoneos-version-min=14.0 -isysroot  -Xlinker -install_name -Xlinker @rpath/HookLogger.dylib -o HookLogger.dylib HookLogger.m
-          brew install ldid 2>/dev/null || true
-          ldid -S HookLogger.dylib
-          ls -lh HookLogger.dylib
+      - name: Build
+        run: xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -fobjc-arc -framework Foundation -miphoneos-version-min=14.0 -isysroot  -o HookLogger.dylib HookLogger.m && brew install ldid 2>/dev/null || true && ldid -S HookLogger.dylib && ls -lh HookLogger.dylib
       - uses: actions/upload-artifact@v4
         with:
           name: HookLogger-dylib
