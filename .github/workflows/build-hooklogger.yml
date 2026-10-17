@@ -13,9 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build HookLogger.dylib
         run: |
-          SDK=
-          INSTALL_NAME="@rpath/HookLogger.dylib"
-          xcrun --sdk iphoneos clang             -dynamiclib -arch arm64 -fobjc-arc             -framework Foundation             -miphoneos-version-min=14.0             -isysroot              -Wl,-install_name,             -o HookLogger.dylib             HookLogger.m
+          xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -fobjc-arc -framework Foundation -miphoneos-version-min=14.0 -isysroot  -Xlinker -install_name -Xlinker @rpath/HookLogger.dylib -o HookLogger.dylib HookLogger.m
           brew install ldid 2>/dev/null || true
           ldid -S HookLogger.dylib
           ls -lh HookLogger.dylib
