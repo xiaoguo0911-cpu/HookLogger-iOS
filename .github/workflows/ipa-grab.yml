@@ -13,21 +13,95 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install deps
+
+      - name: Boot iOS Simulator
         run: |
-          pip3 install playwright pycryptodome --break-system-packages --quiet
-          playwright install webkit
-      - name: Run
-        env:
-          TARGET_URL: ${{ github.event.inputs.target_url }}
-        run: python3 scripts/grab.py
-      - name: Upload screenshot
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: screenshot-${{ github.run_number }}
-          path: /tmp/screenshot.png
-          retention-days: 3
+          SIM=$(xcrun simctl list devices available | grep "iPhone 1" | grep -v unavailable | head -1 | grep -oE '[0-9A-F-]{36}')
+          echo "SIM=$SIM" && echo "SIM=$SIM" >> $GITHUB_ENV
+          xcrun simctl boot "$SIM" || true
+          sleep 10
+          echo "Booted: $SIM"
+
+      - name: Open URL in Simulator Safari
+        run: |
+          xcrun simctl openurl "$SIM" "${{ github.event.inputs.target_url }}" || true
+          echo "URL opened, waiting for page to load..."
+          sleep 15
+
+      - name: Screenshot page
+        run: |
+          xcrun simctl io "$SIM" screenshot /tmp/screen1.png 2>/dev/null || true
+          echo "Screenshot taken"
+
+      - name: Find and tap Install button
+        run: |
+          pip3 install Pillow --break-system-packages --quiet 2>/dev/null || true
+          python3 << 'PYEOF'
+import subprocess, time, sys
+
+SIM = open('/tmp/sim_id.txt').read().strip() if __import__('os').path.exists('/tmp/sim_id.txt') else __import__('os').environ.get('SIM','')
+
+# 模拟器分辨率 390x844，安装按钮大概在屏幕中间偏下
+# 根据之前的截图，安装按钮大约在 y=580 左右
+tap_coords = [
+    (195, 580),  # 安装按钮
+    (195, 550),
+    (195, 500),
+    (195, 450),
+]
+
+for x, y in tap_coords:
+    print(f"Tapping ({x}, {y})...")
+    subprocess.run(['xcrun', 'simctl', 'io', SIM, 'sendEvent', 'touch', f'{x},{y}'], 
+                   capture_output=True)
+    time.sleep(1)
+PYEOF
+
+      - name: Tap install button via simctl
+        run: |
+          # 点击安装按钮 (根据截图坐标)
+          xcrun simctl io "$SIM" screenshot /tmp/screen_before.png || true
+          # 发送点击事件 - 安装按钮通常在屏幕中央
+          for coord in "195,580" "195,550" "195,500"; do
+            xcrun simctl io "$SIM" sendEvent touch "$coord" 2>/dev/null || true
+            sleep 2
+          done
+          echo "Tapped, waiting for install dialog..."
+          sleep 5
+          xcrun simctl io "$SIM" screenshot /tmp/screen_after_tap.png || true
+
+      - name: Wait for app installation
+        run: |
+          echo "Waiting 60s for app to install..."
+          sleep 60
+          xcrun simctl io "$SIM" screenshot /tmp/screen_installed.png || true
+
+      - name: Find installed app and export IPA
+        run: |
+          SIM_DATA="$HOME/Library/Developer/CoreSimulator/Devices/$SIM/data"
+          echo "=== Installed Apps ==="
+          find "$SIM_DATA/Containers/Bundle/Application" -name "*.app" -maxdepth 2 2>/dev/null | head -20
+
+          # 找最新安装的 app
+          APP=$(find "$SIM_DATA/Containers/Bundle/Application" -name "*.app" -maxdepth 2 2>/dev/null | xargs ls -td 2>/dev/null | head -1)
+          echo "Latest app: $APP"
+
+          if [ -n "$APP" ]; then
+            APP_NAME=$(basename "$APP" .app)
+            echo "App: $APP_NAME"
+
+            # 打包为 IPA
+            mkdir -p /tmp/Payload
+            cp -r "$APP" /tmp/Payload/
+            cd /tmp && zip -r downloaded.ipa Payload/
+            echo "IPA size: $(du -sh /tmp/downloaded.ipa)"
+            echo "Magic: $(xxd /tmp/downloaded.ipa | head -1)"
+          else
+            echo "No app found"
+            ls "$SIM_DATA/Containers/Bundle/Application/" 2>/dev/null || echo "No apps dir"
+            exit 1
+          fi
+
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         if: always()
@@ -35,3 +109,11 @@ jobs:
           name: ipa-${{ github.run_number }}
           path: /tmp/downloaded.ipa
           retention-days: 7
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: /tmp/screen*.png
+          retention-days: 3
