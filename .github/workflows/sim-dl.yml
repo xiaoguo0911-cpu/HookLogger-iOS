@@ -15,6 +15,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Test network access
+        run: |
+          echo "=== curl test ==="
+          curl -sI "https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy" | head -5 || echo "FAILED"
+          curl -sI "https://doe29x10dqvat.cloudfront.net/" | head -5 || echo "FAILED"
+          echo "=== done ==="
+
       - name: Boot iOS Simulator
         run: |
           SIM_ID=$(xcrun simctl list devices available | grep "iPhone 1" | grep -v "unavailable" | head -1 | grep -oE '[0-9A-F-]{36}')
@@ -22,51 +29,31 @@ jobs:
           echo "SIM_ID=$SIM_ID" >> $GITHUB_ENV
           xcrun simctl boot "$SIM_ID" || true
           sleep 10
-          echo "Simulator booted"
 
-      - name: Open URL and wait for download
+      - name: Open URL in Simulator
         run: |
           URL="${{ github.event.inputs.target_url }}"
           echo "Opening: $URL"
-          xcrun simctl openurl "$SIM_ID" "$URL"
-          echo "Waiting 40s for auto-download..."
+          # 先试一个简单 URL
+          xcrun simctl openurl "$SIM_ID" "https://apple.com" && echo "apple.com ok"
+          sleep 3
+          xcrun simctl openurl "$SIM_ID" "$URL" && echo "target URL ok" || echo "target URL FAILED"
           sleep 40
 
-      - name: Find downloaded IPA in simulator
+      - name: Find IPA in simulator
         run: |
           SIM_DATA="$HOME/Library/Developer/CoreSimulator/Devices/$SIM_ID"
-          echo "Simulator data: $SIM_DATA"
-          
-          echo "=== Recently downloaded files ==="
-          find "$SIM_DATA" -name "*.ipa" -newer /tmp -ls 2>/dev/null || echo "no .ipa files"
-          find "$SIM_DATA" -name "*.zip" -newer /tmp -ls 2>/dev/null | head -5
-          
-          echo "=== Downloads folder ==="
-          find "$SIM_DATA" -path "*/Downloads/*" -ls 2>/dev/null | head -20
-          
-          echo "=== Staged app files ==="
-          find "$SIM_DATA" -name "*.app" -type d 2>/dev/null | head -10
-          
-          echo "=== All files modified in last 2 min ==="
-          find "$SIM_DATA" -newer /tmp -type f 2>/dev/null | grep -v "\.log\|\.db\|sqlite\|\.DS_Store" | head -30
+          echo "=== Modified files ==="
+          find "$SIM_DATA" -type f -newer /tmp 2>/dev/null | grep -v "\.log\|\.db\|sqlite\|\.DS_Store\|\.plist" | head -20
+          echo "=== IPA files ==="
+          find "$SIM_DATA" -name "*.ipa" 2>/dev/null | head -10
+          echo "=== staged_installer ==="
+          find "$SIM_DATA" -name "staged_installer" -type d 2>/dev/null | head -5
 
-      - name: Check Safari downloads
-        run: |
-          SIM_DATA="$HOME/Library/Developer/CoreSimulator/Devices/$SIM_ID"
-          
-          # Safari downloads
-          find "$SIM_DATA" -path "*Safari*" -type f 2>/dev/null | head -20
-          
-          # Mobile install staging
-          find "$SIM_DATA" -path "*staged_installer*" -type d 2>/dev/null | head -5
-          find "$SIM_DATA" -path "*install*" -name "*.ipa" 2>/dev/null | head -5
-
-      - name: Upload any found IPA
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ipa-${{ github.run_number }}
-          path: |
-            /tmp/downloaded.ipa
-            ~/Library/Developer/CoreSimulator/Devices/${{ env.SIM_ID }}/**/*.ipa
+          path: /tmp/downloaded.ipa
           retention-days: 7
