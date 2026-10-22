@@ -61,20 +61,15 @@ async def main():
                 print(f"[IPA] {url}")
                 ipa_url = url
 
-        # 拦截页面导航（itms-services://）
-        async def on_request(req):
+        # 监听请求（不拦截，只记录）
+        def on_request(req):
             nonlocal itms_url
             url = req.url
             if "itms-services" in url or "itms://" in url:
                 print(f"[ITMS REQ] {url}")
                 itms_url = url
-                await req.abort()
             elif "/clientapi/" in url:
                 print(f"[API REQ] {url}")
-
-        await page.route("**/*", lambda route, req: asyncio.ensure_future(
-            route.abort() if "itms-services" in req.url else route.continue_()
-        ))
 
         page.on("response", on_response)
 
