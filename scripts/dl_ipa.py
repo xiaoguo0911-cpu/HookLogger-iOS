@@ -1,168 +1,136 @@
 #!/usr/bin/env python3
-import asyncio, sys, os, json, re, urllib.request, urllib.parse, xml.etree.ElementTree as ET
+import asyncio, hashlib, base64, json, sys, os, urllib.request, urllib.parse
+import xml.etree.ElementTree as ET
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 from playwright.async_api import async_playwright
 
-CF_URL = "https://doe29x10dqvat.cloudfront.net/1cfhnSTQ1T3tLpjtE"
-REFERER = "https://yjriz.nzctjvr.com/"
+TARGET = os.environ.get("TARGET_URL", "")
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
-BASE = "https://doe29x10dqvat.cloudfront.net"
-APPID = "1cfhnSTQ1T3tLpjtE"
+
+def aes_dec(enc_b64, nonce):
+    key32 = hashlib.md5((nonce + "@&!36SECRET").encode()).hexdigest()
+    key = key32[:16].encode()
+    iv  = key32[16:32].encode()
+    c   = AES.new(key, AES.MODE_CBC, iv)
+    return json.loads(unpad(c.decrypt(base64.b64decode(enc_b64)), 16).decode())
 
 def extract_ipa_url(plist_xml):
     root = ET.fromstring(plist_xml)
-    def find(node):
+    def find_url(node):
         ch = list(node)
-        for i, c in enumerate(ch):
-            if c.tag == "key" and c.text == "url": return ch[i+1].text
-            r = find(c); 
-            if r: return r
-    return find(root)
+        for i, child in enumerate(ch):
+            if child.tag == "key" and child.text == "url":
+                return ch[i+1].text
+            r = find_url(child)
+            if r:
+                return r
+    return find_url(root)
 
 async def main():
-    itms_caught = []
+    captured = {}
 
     async with async_playwright() as p:
         browser = await p.webkit.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=UA, viewport={"width": 390, "height": 844},
-            extra_http_headers={"Referer": REFERER}
-        )
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'platform', {get: () => 'iPhone'});
-            Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 5});
-            window.__xhrLog = [];
-            const _o = XMLHttpRequest.prototype.open;
-            const _s = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.open = function(m, u) { this._u = u; return _o.apply(this, arguments); };
-            XMLHttpRequest.prototype.send = function(b) {
-                const s = this;
-                s.addEventListener('readystatechange', function() {
-                    if (s.readyState === 4) window.__xhrLog.push({url: s._u, status: s.status, resp: (s.responseText||'').slice(0,3000)});
-                });
-                return _s.apply(this, arguments);
-            };
-        """)
-
+        context = await browser.new_context(user_agent=UA)
         page = await context.new_page()
 
-        # 拦截 itms-services 协议
-        async def handle_itms(route):
-            url = route.request.url
-            itms_caught.append(url)
-            print(f"[ITMS] {url}")
-            await route.abort()
+        async def on_request(req):
+            h = req.headers
+            nonce = h.get("x-resp-enc") or h.get("X-RESP-ENC")
+            if nonce:
+                url = req.url
+                print(f"[REQ nonce] {url}  nonce={nonce}")
+                if "download_app_info" in url:
+                    captured["app_nonce"] = nonce
+                elif "getPlistPath" in url:
+                    captured["plist_nonce"] = nonce
 
-        await page.route("itms-services://**", handle_itms)
+        async def on_response(resp):
+            url = resp.url
+            try:
+                body = await resp.text()
+            except Exception:
+                return
 
-        console_logs = []
-        page.on("console", lambda m: console_logs.append(m.text))
+            if "download_app_info" in url:
+                print(f"[download_app_info] {body[:200]}")
+                n = captured.get("app_nonce")
+                if n:
+                    try:
+                        d = aes_dec(body.strip(), n)
+                        print(f"[decoded app_info] {json.dumps(d)[:400]}")
+                        captured["app_info"] = d
+                    except Exception as e:
+                        print(f"[dec err] {e}")
 
-        print("goto REFERER...")
-        await page.goto(REFERER, wait_until="commit", timeout=10000)
-        await asyncio.sleep(1)
+            elif "getPlistPath" in url:
+                print(f"[getPlistPath] {body[:200]}")
+                n = captured.get("plist_nonce")
+                if n:
+                    try:
+                        d = aes_dec(body.strip(), n)
+                        print(f"[decoded plist] {json.dumps(d)[:400]}")
+                        captured["plist_data"] = d
+                    except Exception as e:
+                        print(f"[dec err] {e}")
+                else:
+                    print(f"[no plist_nonce yet, raw={body[:100]}]")
 
-        print("goto CF...")
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+        print(f"[*] goto {TARGET}")
         try:
-            await page.goto(CF_URL, wait_until="networkidle", timeout=30000)
+            await page.goto(TARGET, wait_until="networkidle", timeout=60000)
         except Exception as e:
-            print(f"goto: {e}")
+            print(f"[goto] {e}")
 
         await asyncio.sleep(10)
-
-        print(f"ITMS: {itms_caught}")
-        print(f"Console: {console_logs[:5]}")
-
-        xhr = await page.evaluate("() => window.__xhrLog")
-        download_key = None
-        for e in xhr:
-            print(f"XHR [{e['status']}] {e['url']}")
-            if 'downloadKey' in e.get('resp', ''):
-                try: download_key = json.loads(e['resp'])['data']['downloadKey']
-                except: pass
-
-        if not download_key:
-            print("no DK"); sys.exit(1)
-
-        print(f"DK: {download_key}")
-
-        # React fiber BFS 找 itms URL
-        itms_react = await page.evaluate("""() => {
-            try {
-                const root = document.getElementById('root');
-                if (!root) return 'no #root';
-                const k = Object.keys(root).find(k => k.startsWith('__react'));
-                if (!k) return 'no react key, keys=' + Object.keys(root).slice(0,5).join(',');
-                const queue = [root[k]];
-                let i = 0;
-                while (queue.length && i < 2000) {
-                    i++;
-                    const n = queue.shift();
-                    if (!n) continue;
-                    if (n.memoizedState) {
-                        const s = n.memoizedState;
-                        // 找 queue 里的 itms
-                        if (s.queue && s.queue.dispatch) {
-                            // skip
-                        }
-                        if (s.memoizedState && typeof s.memoizedState === 'string' && s.memoizedState.includes('itms')) {
-                            return s.memoizedState;
-                        }
-                    }
-                    if (n.memoizedProps) {
-                        const p = n.memoizedProps;
-                        for (const pk of Object.keys(p)) {
-                            const v = p[pk];
-                            if (typeof v === 'string' && v.includes('itms-services')) return v;
-                        }
-                    }
-                    if (n.child) queue.push(n.child);
-                    if (n.sibling) queue.push(n.sibling);
-                }
-                return 'searched ' + i + ' nodes, not found';
-            } catch(e) { return 'err: '+e.message; }
-        }""")
-        print(f"React itms: {itms_react}")
-
-        # 在 DOM 找 a 链接和 canvas
-        links = await page.evaluate("""() => ({
-            a: Array.from(document.querySelectorAll('a')).map(x=>x.href),
-            canvas: document.querySelectorAll('canvas').length,
-            txt: document.body.innerText.slice(0,300)
-        })""")
-        print(f"Links: {links['a']}")
-        print(f"Canvas: {links['canvas']}")
-        print(f"Text: {links['txt']}")
-
-        # 拿 itms 或 plist
-        itms_url = itms_caught[0] if itms_caught else None
-        if not itms_url and isinstance(itms_react, str) and itms_react.startswith('itms'):
-            itms_url = itms_react
-
-        if not itms_url:
-            print("[!] no itms URL found"); sys.exit(1)
-
-        print(f"\nitms URL: {itms_url}")
-        plist_url = re.search(r'url=([^&]+)', itms_url)
-        if plist_url:
-            plist_url = urllib.parse.unquote(plist_url.group(1))
-            print(f"plist URL: {plist_url}")
-            r = urllib.request.urlopen(urllib.request.Request(plist_url, headers={"User-Agent": UA}), timeout=15)
-            plist_xml = r.read().decode()
-            ipa_url = extract_ipa_url(plist_xml)
-            print(f"IPA URL: {ipa_url}")
-            if ipa_url:
-                out = "/tmp/downloaded.ipa"
-                r2 = urllib.request.urlopen(urllib.request.Request(ipa_url, headers={"User-Agent": UA}), timeout=300)
-                total = int(r2.headers.get("Content-Length", 0))
-                done = 0
-                with open(out, "wb") as f:
-                    while True:
-                        chunk = r2.read(65536)
-                        if not chunk: break
-                        f.write(chunk); done += len(chunk)
-                        if total: print(f"{done*100//total}%", end="\r", flush=True)
-                print(f"\nDone! {os.path.getsize(out):,} bytes")
-
+        cookies = await context.cookies()
+        print(f"[cookies] {[c['name'] for c in cookies]}")
         await browser.close()
+
+    print(f"\n[captured] {list(captured.keys())}")
+
+    plist_url = None
+    if "plist_data" in captured:
+        raw = captured["plist_data"].get("plistFullPath", "")
+        plist_url = urllib.parse.unquote(raw)
+        print(f"[plist URL] {plist_url}")
+
+    if not plist_url or not plist_url.startswith("http"):
+        print("[!] 未获取到 plist URL")
+        sys.exit(1)
+
+    req = urllib.request.Request(plist_url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        plist_xml = r.read().decode()
+    print(f"[plist xml] {plist_xml[:300]}")
+
+    ipa_url = extract_ipa_url(plist_xml)
+    print(f"[IPA URL] {ipa_url}")
+    if not ipa_url:
+        print("[!] 未能从 plist 提取 IPA URL")
+        sys.exit(1)
+
+    out = "/tmp/downloaded.ipa"
+    print(f"[*] 下载 IPA -> {out}")
+    req2 = urllib.request.Request(ipa_url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req2, timeout=300) as r:
+        total = int(r.headers.get("Content-Length", 0))
+        done = 0
+        with open(out, "wb") as f:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    print(f"  {done*100//total}%", end="\r", flush=True)
+    size = os.path.getsize(out)
+    magic = open(out, "rb").read(4).hex()
+    print(f"\n[完成] {size:,} bytes  magic={magic} {'OK' if magic=='504b0304' else 'BAD'}")
 
 asyncio.run(main())
