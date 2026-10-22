@@ -13,66 +13,18 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Boot Simulator
+      - name: Install deps
         run: |
-          SIM=$(xcrun simctl list devices available | grep "iPhone 1" | grep -v unavailable | head -1 | grep -oE '[0-9A-F-]{36}')
-          echo "SIM=$SIM" && echo "SIM=$SIM" >> $GITHUB_ENV
-          xcrun simctl boot "$SIM" || true
-          sleep 12
-
-      - name: Open URL
-        run: |
-          xcrun simctl openurl "$SIM" "${{ github.event.inputs.target_url }}" || true
-          sleep 15
-          xcrun simctl io "$SIM" screenshot /tmp/screen1.png 2>/dev/null || true
-
-      - name: Tap Install button
-        run: |
-          # 安装按钮在屏幕中间
-          xcrun simctl io "$SIM" sendEvent touch "195,580" 2>/dev/null || true
-          sleep 3
-          xcrun simctl io "$SIM" sendEvent touch "195,550" 2>/dev/null || true
-          sleep 3
-          xcrun simctl io "$SIM" sendEvent touch "195,500" 2>/dev/null || true
-          sleep 3
-          xcrun simctl io "$SIM" screenshot /tmp/screen2.png 2>/dev/null || true
-
-      - name: Wait for install
-        run: |
-          echo "Waiting 90s for app install..."
-          sleep 90
-          xcrun simctl io "$SIM" screenshot /tmp/screen3.png 2>/dev/null || true
-
-      - name: Export IPA
-        run: |
-          SIM_DATA="$HOME/Library/Developer/CoreSimulator/Devices/$SIM/data"
-          echo "=== Apps ==="
-          find "$SIM_DATA/Containers/Bundle/Application" -maxdepth 2 -name "*.app" 2>/dev/null || echo "no apps"
-
-          APP=$(find "$SIM_DATA/Containers/Bundle/Application" -maxdepth 2 -name "*.app" 2>/dev/null | xargs ls -td 2>/dev/null | head -1)
-          echo "App: $APP"
-
-          if [ -n "$APP" ]; then
-            mkdir -p /tmp/Payload
-            cp -r "$APP" /tmp/Payload/
-            cd /tmp && zip -r downloaded.ipa Payload/
-            ls -lh /tmp/downloaded.ipa
-          else
-            echo "No app installed"; exit 1
-          fi
-
+          pip3 install playwright --break-system-packages --quiet
+          playwright install webkit
+      - name: Run
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+        run: python3 scripts/grab.py
       - name: Upload IPA
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ipa-${{ github.run_number }}
           path: /tmp/downloaded.ipa
           retention-days: 7
-
-      - name: Upload screenshots
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: screens-${{ github.run_number }}
-          path: /tmp/screen*.png
-          retention-days: 3
