@@ -76,19 +76,13 @@ async def main():
 
         print(f"[*] 访问 {TARGET}")
         try:
-            await page.goto(TARGET, wait_until="networkidle", timeout=60000)
+            await page.goto(TARGET, wait_until="load", timeout=60000)
         except Exception as e:
             print(f"[goto] {e}")
 
-        # 等 React 渲染
-        print("[*] 等待页面元素...")
-        try:
-            await page.wait_for_selector("button, a, [class*='btn'], [class*='download']", timeout=15000)
-            print("[*] 元素已出现")
-        except Exception:
-            print("[*] 等待超时，继续")
-
-        await asyncio.sleep(3)
+        # 等待 React 完全渲染 + API 调用完成
+        print("[*] 等待 React 渲染和 API 调用 (20s)...")
+        await asyncio.sleep(20)
 
         # 打印所有文本元素
         texts = await page.evaluate("""
