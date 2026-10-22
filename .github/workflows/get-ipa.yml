@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install
-        run: pip3 install playwright pycryptodome --quiet && playwright install webkit
+        run: pip3 install playwright pycryptodome --quiet --break-system-packages && playwright install webkit
       - name: Run
         env:
           TARGET_URL: ${{ github.event.inputs.url || 'https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy' }}
