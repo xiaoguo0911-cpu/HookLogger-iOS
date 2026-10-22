@@ -1,0 +1,54 @@
+name: Proxy Capture IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait_minutes:
+        description: 'Wait minutes for phone to connect'
+        required: false
+        default: '5'
+
+jobs:
+  capture:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mitmproxy
+        run: pipx install mitmproxy
+
+      - name: Start proxy and print connection info
+        run: |
+          # 获取公网 IP
+          PUBLIC_IP=$(curl -s ifconfig.me)
+          echo "=========================================="
+          echo "手机代理设置:"
+          echo "  服务器: $PUBLIC_IP"
+          echo "  端口: 8080"
+          echo "=========================================="
+          echo "证书安装: 手机Safari访问 http://$PUBLIC_IP:8080 点 Certificate"
+          echo "=========================================="
+
+          # 启动 mitmproxy
+          pipx run mitmdump -p 8080 --save-stream-file /tmp/traffic.mitm &
+          PROXY_PID=$!
+          echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
+
+          # 等待用户连接手机
+          WAIT=${{ github.event.inputs.wait_minutes }}
+          echo "等待 ${WAIT} 分钟让手机下载..."
+          sleep $((WAIT * 60))
+
+          kill $PROXY_PID 2>/dev/null || true
+          sleep 2
+
+      - name: Extract IPA from traffic
+        run: python3 scripts/extract_ipa.py
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-captured-${{ github.run_number }}
+          path: /tmp/downloaded.ipa
+          retention-days: 7
