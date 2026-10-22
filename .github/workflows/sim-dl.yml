@@ -1,0 +1,167 @@
+name: DL IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL'
+        required: true
+        default: 'https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy'
+
+jobs:
+  download:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup mitmproxy + iOS Simulator
+        run: |
+          pip3 install mitmproxy --break-system-packages --quiet
+
+          # 启动 mitmproxy 代理（后台）
+          mitmdump -p 8080 --save-stream-file /tmp/traffic.mitm &
+          MITM_PID=$!
+          echo "MITM_PID=$MITM_PID" >> $GITHUB_ENV
+
+          # 等 mitmproxy 启动
+          sleep 3
+
+          # 生成 mitmproxy 证书（通过一次连接触发）
+          curl -x http://127.0.0.1:8080 -sk http://mitm.it/cert/pem -o /tmp/mitmproxy-ca.pem || true
+          ls ~/.mitmproxy/
+
+      - name: Boot iOS Simulator
+        run: |
+          # 找可用的 iPhone 模拟器
+          SIM_ID=$(xcrun simctl list devices available | grep "iPhone" | grep -v "unavailable" | head -1 | grep -oE '[0-9A-F-]{36}')
+          echo "SIM_ID=$SIM_ID"
+          echo "SIM_ID=$SIM_ID" >> $GITHUB_ENV
+
+          # 启动模拟器
+          xcrun simctl boot "$SIM_ID" || true
+          sleep 5
+
+          # 安装 mitmproxy CA 证书到模拟器
+          CERT_PATH="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+          if [ -f "$CERT_PATH" ]; then
+            xcrun simctl keychain "$SIM_ID" add-root-cert "$CERT_PATH"
+            echo "CA cert installed"
+          fi
+
+          # 设置模拟器使用代理
+          xcrun simctl spawn "$SIM_ID" defaults write com.apple.mobilesafari WebKitJavaScriptEnabled -bool true
+          defaults write com.apple.CoreSimulator.CoreSimulatorService SimulatorNetworkProxySettings -dict HTTPSProxyHost "127.0.0.1" HTTPSProxyPort "8080" HTTPProxyHost "127.0.0.1" HTTPProxyPort "8080"
+
+      - name: Open URL in iOS Simulator Safari
+        run: |
+          URL="${{ github.event.inputs.target_url }}"
+          echo "Opening: $URL"
+
+          # 用 iOS 模拟器的 Safari 打开 URL
+          xcrun simctl openurl "$SIM_ID" "$URL"
+          echo "URL opened, waiting for auto-download..."
+          sleep 20
+
+          # 再等等
+          sleep 15
+
+      - name: Extract IPA from traffic
+        run: |
+          # 停止 mitmproxy
+          kill $MITM_PID 2>/dev/null || true
+          sleep 2
+
+          # 分析流量找 itms-services 或 IPA URL
+          python3 << 'PYEOF'
+import subprocess, sys, os
+
+# 用 mitmproxy 的 Python API 分析流量
+try:
+    from mitmproxy import io as mio
+    from mitmproxy.http import HTTPFlow
+    
+    ipa_url = None
+    itms_url = None
+    plist_url = None
+    
+    with open("/tmp/traffic.mitm", "rb") as f:
+        reader = mio.FlowReader(f)
+        for flow in reader.stream():
+            url = flow.request.pretty_url if hasattr(flow, 'request') else ''
+            if '.ipa' in url.lower():
+                ipa_url = url
+                print(f"[IPA] {url}")
+            if 'itms-services' in url:
+                itms_url = url
+                print(f"[ITMS] {url}")
+            if 'plist' in url.lower():
+                plist_url = url
+                print(f"[PLIST] {url}")
+    
+    print(f"\nipa_url: {ipa_url}")
+    print(f"itms_url: {itms_url}")
+    print(f"plist_url: {plist_url}")
+    
+    # 下载 IPA
+    import urllib.request
+    UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15"
+    
+    if ipa_url:
+        print(f"Downloading IPA from: {ipa_url}")
+        r = urllib.request.urlopen(urllib.request.Request(ipa_url, headers={"User-Agent": UA}), timeout=300)
+        with open("/tmp/downloaded.ipa", "wb") as f:
+            while True:
+                chunk = r.read(65536)
+                if not chunk: break
+                f.write(chunk)
+        print(f"Done: {os.path.getsize('/tmp/downloaded.ipa'):,} bytes")
+    elif plist_url:
+        import xml.etree.ElementTree as ET, urllib.parse
+        print(f"Getting plist: {plist_url}")
+        r = urllib.request.urlopen(urllib.request.Request(plist_url, headers={"User-Agent": UA}), timeout=15)
+        xml_data = r.read().decode()
+        root = ET.fromstring(xml_data)
+        def find_url(node):
+            ch = list(node)
+            for i,c in enumerate(ch):
+                if c.tag=="key" and c.text=="url": return ch[i+1].text
+                r = find_url(c)
+                if r: return r
+        dl_url = find_url(root)
+        print(f"Download URL: {dl_url}")
+        if dl_url:
+            r2 = urllib.request.urlopen(urllib.request.Request(dl_url, headers={"User-Agent": UA}), timeout=300)
+            with open("/tmp/downloaded.ipa", "wb") as f:
+                total = int(r2.headers.get("Content-Length",0))
+                done = 0
+                while True:
+                    chunk = r2.read(65536)
+                    if not chunk: break
+                    f.write(chunk); done+=len(chunk)
+                    if total: print(f"{done*100//total}%", end="\r", flush=True)
+            print(f"\nDone: {os.path.getsize('/tmp/downloaded.ipa'):,} bytes")
+    else:
+        print("No IPA/plist URL found in traffic")
+        sys.exit(1)
+        
+except Exception as e:
+    print(f"Error: {e}")
+    import traceback; traceback.print_exc()
+    sys.exit(1)
+PYEOF
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-${{ github.run_number }}
+          path: /tmp/downloaded.ipa
+          retention-days: 7
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: /tmp/screen*.png
+          retention-days: 3
