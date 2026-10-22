@@ -4,31 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: Target URL
+        description: 'Target URL'
         required: true
-        default: https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy
+        default: 'https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy'
 
 jobs:
   download:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Boot
+
+      - name: Install deps
         run: |
-          SIM=$(xcrun simctl list devices available | grep "iPhone 1" | grep -v unavailable | head -1 | grep -oE "[0-9A-F-]{36}")
-          echo "SIM=$SIM" && echo "SIM=$SIM" >> $GITHUB_ENV
-          xcrun simctl boot "$SIM" || true && sleep 8
-      - name: Open URL
-        run: |
-          xcrun simctl spawn "$SIM" log stream --level debug > /tmp/log.txt 2>&1 &
-          sleep 2
-          xcrun simctl openurl "$SIM" "${{ github.event.inputs.target_url }}" || true
-          sleep 50
-          kill %1 2>/dev/null; true
-          grep -oE "itms-services://[^ ]+" /tmp/log.txt | head -5
-          grep -oE "https?://[^ ]+" /tmp/log.txt | grep -v "apple\|icloud\|push\|ocsp\|mzstatic" | sort -u | head -20
-      - name: DL
-        run: python3 scripts/sim_extract2.py
+          pip3 install playwright --break-system-packages --quiet
+          playwright install webkit
+
+      - name: Run
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+        run: python3 scripts/grab.py
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
