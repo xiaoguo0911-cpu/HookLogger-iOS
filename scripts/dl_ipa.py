@@ -38,9 +38,10 @@ async def main():
             except Exception:
                 return
 
+            # 打印所有响应
+            print(f"[RESP {resp.status}] {url[:100]}")
             if "/clientapi/" in url:
-                print(f"[API {resp.status}] {url}")
-                print(f"  {body[:200]}")
+                print(f"  BODY: {body[:200]}")
 
             if "getinfo" in url:
                 try:
