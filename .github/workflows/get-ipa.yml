@@ -16,50 +16,136 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Boot iOS Simulator
+      - name: Install mitmproxy
+        run: pip3 install mitmproxy --break-system-packages --quiet
+
+      - name: Start mitmproxy and boot simulator
         run: |
+          # 启动 mitmproxy 记录流量
+          mitmdump -p 8080 --save-stream-file /tmp/traffic.mitm --ssl-insecure &
+          MITM_PID=$!
+          echo "MITM_PID=$MITM_PID" >> $GITHUB_ENV
+          sleep 3
+
+          # 找模拟器
           SIM=$(xcrun simctl list devices available -j | python3 -c "
           import sys,json
           d=json.load(sys.stdin)['devices']
-          for runtime,devs in d.items():
-              if 'iOS' in runtime:
+          for rt,devs in d.items():
+              if 'iOS' in rt:
                   for dev in devs:
                       if 'iPhone' in dev['name'] and dev['isAvailable']:
-                          print(dev['udid'])
-                          exit()
+                          print(dev['udid']); exit()
           ")
           echo "SIM=$SIM" >> $GITHUB_ENV
           echo "Booting: $SIM"
           xcrun simctl boot "$SIM" || true
-          sleep 20
-          xcrun simctl list | grep Booted
+          sleep 15
 
-      - name: Open URL in Simulator Safari
+          # 安装 mitmproxy CA 到模拟器
+          CERT="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+          if [ -f "$CERT" ]; then
+            xcrun simctl keychain "$SIM" add-root-cert "$CERT" || true
+            echo "CA installed"
+          else
+            echo "No CA cert found at $CERT"
+            ls ~/.mitmproxy/ || true
+          fi
+
+          # 设置模拟器代理
+          PROXY_CFG="$HOME/Library/Developer/CoreSimulator/Devices/$SIM/data/Library/Preferences/com.apple.SystemConfiguration.plist"
+          defaults write "$HOME/Library/Developer/CoreSimulator/Devices/$SIM/data/Library/Preferences/com.apple.mobilewifi" HTTPProxy "127.0.0.1"
+          defaults write "$HOME/Library/Developer/CoreSimulator/Devices/$SIM/data/Library/Preferences/com.apple.mobilewifi" HTTPPort 8080
+          defaults write "$HOME/Library/Developer/CoreSimulator/Devices/$SIM/data/Library/Preferences/com.apple.mobilewifi" HTTPSProxy "127.0.0.1"
+          defaults write "$HOME/Library/Developer/CoreSimulator/Devices/$SIM/data/Library/Preferences/com.apple.mobilewifi" HTTPSPort 8080
+
+      - name: Open URL and capture traffic
         run: |
           URL="${{ github.event.inputs.url || 'https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy' }}"
           echo "Opening: $URL"
           xcrun simctl openurl booted "$URL"
-          echo "Waiting 45s for install..."
-          sleep 45
+          sleep 30
 
-      - name: Export IPA
+      - name: Extract IPA URL from traffic and download
         run: |
-          SIM_DATA="$HOME/Library/Developer/CoreSimulator/Devices/$SIM/data"
-          echo "Searching apps in: $SIM_DATA"
-          find "$SIM_DATA/Containers/Bundle/Application" -name "*.app" -maxdepth 2 2>/dev/null || true
+          kill $MITM_PID 2>/dev/null || true
+          sleep 2
 
-          APP=$(find "$SIM_DATA/Containers/Bundle/Application" -name "*.app" -maxdepth 2 2>/dev/null | tail -1)
-          if [ -z "$APP" ]; then
-            echo "No app found!"
-            exit 1
-          fi
-          echo "Found: $APP"
-          mkdir -p /tmp/Payload
-          cp -r "$APP" /tmp/Payload/
-          cd /tmp && zip -r downloaded.ipa Payload/
-          echo "Done: $(du -sh downloaded.ipa)"
+          python3 << 'PYEOF'
+import os, sys, urllib.request, re, json
+import xml.etree.ElementTree as ET
+
+UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+
+# 分析流量文件
+ipa_url = None
+plist_url = None
+
+try:
+    from mitmproxy import io as mio
+    with open("/tmp/traffic.mitm", "rb") as f:
+        for flow in mio.FlowReader(f).stream():
+            if not hasattr(flow, 'request'):
+                continue
+            url = flow.request.pretty_url
+            print(f"[流量] {url[:100]}")
+            if '.ipa' in url:
+                ipa_url = url
+                print(f"  >> IPA URL: {url}")
+            if 'plist' in url.lower():
+                plist_url = url
+                print(f"  >> PLIST URL: {url}")
+            if 'itms-services' in url:
+                m = re.search(r'url=([^&]+)', url)
+                if m:
+                    plist_url = urllib.parse.unquote(m.group(1))
+                    print(f"  >> ITMS plist: {plist_url}")
+except Exception as e:
+    print(f"[流量分析] err: {e}")
+
+# 如果流量里有 plist，从中提取 IPA URL
+if plist_url and not ipa_url:
+    print(f"[*] 获取 plist: {plist_url}")
+    try:
+        req = urllib.request.Request(plist_url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            xml = r.read().decode()
+        print(f"[plist] {xml[:300]}")
+        root = ET.fromstring(xml)
+        def find_url(node):
+            ch = list(node)
+            for i,c in enumerate(ch):
+                if c.tag=="key" and c.text=="url": return ch[i+1].text
+                r = find_url(c)
+                if r: return r
+        ipa_url = find_url(root)
+        print(f"[IPA URL] {ipa_url}")
+    except Exception as e:
+        print(f"err: {e}")
+
+if not ipa_url:
+    print("[!] 未找到 IPA URL")
+    sys.exit(1)
+
+# 下载 IPA
+print(f"[*] 下载: {ipa_url}")
+req = urllib.request.Request(ipa_url, headers={"User-Agent": UA})
+with urllib.request.urlopen(req, timeout=300) as r:
+    total = int(r.headers.get("Content-Length", 0))
+    done = 0
+    with open("/tmp/downloaded.ipa", "wb") as f:
+        while True:
+            chunk = r.read(65536)
+            if not chunk: break
+            f.write(chunk); done+=len(chunk)
+            if total: print(f"  {done*100//total}%", end="\r", flush=True)
+size = os.path.getsize("/tmp/downloaded.ipa")
+magic = open("/tmp/downloaded.ipa","rb").read(4).hex()
+print(f"\n[完成] {size:,} bytes  magic={magic}")
+PYEOF
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ipa-${{ github.run_number }}
           path: /tmp/downloaded.ipa
