@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-import asyncio, sys, os, json, re, urllib.request, urllib.parse, plistlib
+import asyncio, sys, os, json, re, urllib.request, urllib.parse
 from playwright.async_api import async_playwright
 
+TARGET = "https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy"
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
-BASE = "https://doe29x10dqvat.cloudfront.net"
-APPID = "1cfhnSTQ1T3tLpjtE"
 
 async def main():
     itms_urls = []
-    inhouse_info = {}
 
     async with async_playwright() as p:
         browser = await p.webkit.launch(headless=True)
         context = await browser.new_context(
             user_agent=UA, viewport={"width":390,"height":844},
-            extra_http_headers={"Referer":"https://yjriz.nzctjvr.com/"}
         )
         await context.add_init_script("""
             Object.defineProperty(navigator,'platform',{get:()=>'iPhone'});
@@ -38,14 +35,18 @@ async def main():
             await route.abort()
         await page.route("itms-services://**", on_itms)
 
-        print("loading...")
+        # 直接访问原始 URL，让它自动跳转到最新的 CF 域名
+        print(f"goto {TARGET}")
         try:
-            await page.goto(BASE+"/"+APPID, wait_until="networkidle", timeout=30000)
+            await page.goto(TARGET, wait_until="load", timeout=30000)
         except Exception as e:
-            print(f"goto: {e}")
-            sys.exit(1)
+            print(f"goto err: {e}")
 
+        print(f"after goto: {page.url}")
+
+        # 等待 CF 页面的 API 调用
         await asyncio.sleep(20)
+        print(f"final url: {page.url}")
 
         xhr = await page.evaluate("()=>window.__log||[]")
         dk = None
@@ -56,38 +57,33 @@ async def main():
                 try: dk = json.loads(e['resp'])['data']['downloadKey']
                 except: pass
             if 'inhouse' in e['url']:
-                enc_data = json.loads(e['resp']).get('data','')
-                print(f"  inhouse enc={enc_data[:50]}...")
+                try: enc_data = json.loads(e['resp']).get('data','')
+                except: pass
 
-        print(f"dk={dk}, itms={itms_urls}")
-        if not enc_data:
-            print("no enc data"); sys.exit(1)
+        print(f"dk={dk}")
+        print(f"enc_data={enc_data[:50] if enc_data else None}")
+        print(f"itms_urls={itms_urls}")
 
-        # 关键：直接在浏览器里调用解密函数
-        # 找到 _0x3672a3 等函数
-        dec = await page.evaluate("""(encData) => {
-            // 找所有全局 _0x 函数并测试
-            const results = [];
-            for (const k of Object.keys(window)) {
-                if (typeof window[k] !== 'function') continue;
-                if (!k.startsWith('_0x') && !k.startsWith('_$')) continue;
-                try {
-                    // 用 encData 和各种 key 调用
-                    for (const key of ['1cfhnSTQ1T3tLpjtE', '5bhabw', 'com.Jiaqi.RetryP', '']) {
-                        const r = window[k](encData, key);
-                        if (r && typeof r === 'string' && r.length > 30 && r.length < 500) {
-                            results.push({func: k, key, result: r.slice(0, 300)});
-                            if (r.includes('itms') || r.includes('http')) break;
+        if enc_data:
+            # 在页面中调用解密函数
+            dec = await page.evaluate("""(encData) => {
+                const results = [];
+                for (const k of Object.keys(window)) {
+                    if (typeof window[k] !== 'function') continue;
+                    try {
+                        // 尝试用不同 key 调用所有可能的解密函数
+                        for (const key of ['1cfhnSTQ1T3tLpjtE', '5bhabw', 'com.Jiaqi.RetryP', '']) {
+                            const r = window[k](encData, key);
+                            if (r && typeof r === 'string' && r.includes('itms')) {
+                                results.push({func: k, key, r: r.slice(0,300)});
+                            }
                         }
-                    }
-                } catch(e) {}
-            }
-            return results.slice(0, 10);
-        }""", enc_data)
-        print(f"dec candidates: {dec}")
+                    } catch(e) {}
+                }
+                return results;
+            }""", enc_data)
+            print(f"decrypt results: {dec}")
 
-        # 也直接调 inhouse API 然后等 itms
-        print(f"route itms: {itms_urls}")
         await browser.close()
 
 asyncio.run(main())
