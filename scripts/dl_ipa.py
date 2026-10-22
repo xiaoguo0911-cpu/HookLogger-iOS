@@ -100,7 +100,8 @@ def main():
     print(f"[*] downloadKey={download_key}")
 
     # Step 2: 调用 inhouse API（curl 方式，返回明文 itms URL）
-    inhouse_url = f"{base}/clientapi/app/inhouse?appid={appid}&k={download_key}&c=&lang=zh_CN&zh=1"
+    # 注意: 不加 zh=1 参数，否则服务器返回 AES 加密数据
+    inhouse_url = f"{base}/clientapi/app/inhouse?appid={appid}&k={download_key}&c=&lang=zh_CN"
     print(f"[*] 调 inhouse: {inhouse_url}")
     body = http_get(inhouse_url)
     print(f"[inhouse resp] {body[:300]}")
