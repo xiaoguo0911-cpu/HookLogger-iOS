@@ -15,40 +15,64 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Test network access
-        run: |
-          echo "=== curl test ==="
-          curl -sI "https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy" | head -5 || echo "FAILED"
-          curl -sI "https://doe29x10dqvat.cloudfront.net/" | head -5 || echo "FAILED"
-          echo "=== done ==="
-
       - name: Boot iOS Simulator
         run: |
           SIM_ID=$(xcrun simctl list devices available | grep "iPhone 1" | grep -v "unavailable" | head -1 | grep -oE '[0-9A-F-]{36}')
           echo "SIM_ID=$SIM_ID"
           echo "SIM_ID=$SIM_ID" >> $GITHUB_ENV
           xcrun simctl boot "$SIM_ID" || true
-          sleep 10
+          sleep 8
 
-      - name: Open URL in Simulator
+      - name: Monitor logs + Open URL
         run: |
-          URL="${{ github.event.inputs.target_url }}"
-          echo "Opening: $URL"
-          # 先试一个简单 URL
-          xcrun simctl openurl "$SIM_ID" "https://apple.com" && echo "apple.com ok"
-          sleep 3
-          xcrun simctl openurl "$SIM_ID" "$URL" && echo "target URL ok" || echo "target URL FAILED"
-          sleep 40
+          # 开始监控模拟器日志，保存到文件
+          xcrun simctl spawn "$SIM_ID" log stream --level debug > /tmp/sim_log.txt 2>&1 &
+          LOG_PID=$!
+          sleep 2
 
-      - name: Find IPA in simulator
+          # 打开目标 URL
+          xcrun simctl openurl "$SIM_ID" "${{ github.event.inputs.target_url }}" || true
+          echo "URL opened, waiting 50s..."
+          sleep 50
+
+          kill $LOG_PID 2>/dev/null || true
+          echo "Log lines: $(wc -l < /tmp/sim_log.txt)"
+          echo "=== itms in log ==="
+          grep -i "itms\|plist\|\.ipa" /tmp/sim_log.txt | head -20
+          echo "=== all URLs in log ==="
+          grep -oE "https?://[^ ]+" /tmp/sim_log.txt | grep -v "apple.com\|icloud\|push\|ocsp\|telemetry" | sort -u | head -30
+
+      - name: Extract and download IPA
         run: |
-          SIM_DATA="$HOME/Library/Developer/CoreSimulator/Devices/$SIM_ID"
-          echo "=== Modified files ==="
-          find "$SIM_DATA" -type f -newer /tmp 2>/dev/null | grep -v "\.log\|\.db\|sqlite\|\.DS_Store\|\.plist" | head -20
-          echo "=== IPA files ==="
-          find "$SIM_DATA" -name "*.ipa" 2>/dev/null | head -10
-          echo "=== staged_installer ==="
-          find "$SIM_DATA" -name "staged_installer" -type d 2>/dev/null | head -5
+          # 从日志找 itms-services URL
+          ITMS=$(grep -oE "itms-services://[^ ]+" /tmp/sim_log.txt | head -1)
+          echo "ITMS URL: $ITMS"
+
+          if [ -n "$ITMS" ]; then
+            PLIST_URL=$(echo "$ITMS" | grep -oE "url=[^ &]+" | sed 's/url=//' | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
+            echo "Plist URL: $PLIST_URL"
+            curl -sL -A "iPhone" "$PLIST_URL" -o /tmp/manifest.plist
+            IPA_URL=$(python3 -c "
+import plistlib
+with open('/tmp/manifest.plist','rb') as f:
+    p = plistlib.load(f)
+assets = p.get('items',[{}])[0].get('assets',[])
+for a in assets:
+    if a.get('kind') == 'software-package':
+        print(a['url'])
+        break
+")
+            echo "IPA URL: $IPA_URL"
+            if [ -n "$IPA_URL" ]; then
+              curl -L -A "iPhone" "$IPA_URL" -o /tmp/downloaded.ipa
+              echo "Downloaded: $(wc -c < /tmp/downloaded.ipa) bytes"
+            fi
+          else
+            echo "No itms URL found in log"
+            # 尝试从日志找直接的 plist URL
+            PLIST=$(grep -oE "https?://[^ ]*plist[^ ]*" /tmp/sim_log.txt | head -1)
+            echo "Plist from log: $PLIST"
+          fi
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
