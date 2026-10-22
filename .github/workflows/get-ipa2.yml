@@ -26,12 +26,17 @@ jobs:
           echo "MITM_PID=$!" >> $GITHUB_ENV
           sleep 3
 
-          # 设置 macOS 系统代理（模拟器会继承）
-          networksetup -setwebproxy Wi-Fi 127.0.0.1 8080
-          networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 8080
-          networksetup -setwebproxystate Wi-Fi on
-          networksetup -setsecurewebproxystate Wi-Fi on
-          echo "System proxy set"
+          # 找活跃网络接口并设置代理
+          echo "=== 网络接口 ==="
+          networksetup -listallnetworkservices
+          IFACE=$(networksetup -listallnetworkservices 2>/dev/null | grep -v "An asterisk" | head -1)
+          echo "Using interface: $IFACE"
+          networksetup -setwebproxy "$IFACE" 127.0.0.1 8080 || true
+          networksetup -setsecurewebproxy "$IFACE" 127.0.0.1 8080 || true
+          networksetup -setwebproxystate "$IFACE" on || true
+          networksetup -setsecurewebproxystate "$IFACE" on || true
+          echo "IFACE=$IFACE" >> $GITHUB_ENV
+          echo "System proxy set on $IFACE"
 
       - name: Boot simulator
         run: |
@@ -73,8 +78,8 @@ jobs:
         run: |
           kill $MITM_PID 2>/dev/null || true
           # 关闭系统代理
-          networksetup -setwebproxystate Wi-Fi off || true
-          networksetup -setsecurewebproxystate Wi-Fi off || true
+          networksetup -setwebproxystate "$IFACE" off || true
+          networksetup -setsecurewebproxystate "$IFACE" off || true
           sleep 2
           python3 scripts/dl_mitm.py
 
