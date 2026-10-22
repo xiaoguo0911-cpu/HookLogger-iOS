@@ -84,11 +84,20 @@ async def main():
                     m = re.search(r'appid=([^&]+)', url)
                     if m:
                         app_id = m.group(1)
-                    print(f"  downloadKey={download_key}  installMode={info.get('installMode')}  downloadMode={info.get('downloadMode')}")
-                    # 打印完整的 info 看是否有额外字段
-                    for k, v in info.items():
-                        if v and isinstance(v, str) and ("http" in v or "itms" in v or "plist" in v):
-                            print(f"  {k}={v}")
+                    print(f"  downloadKey={download_key}  appid={app_id}")
+                except Exception as e:
+                    print(f"  err: {e}")
+
+            # 关键: inhouse API 直接返回 itms-services URL
+            if "inhouse" in url and resp.status == 200:
+                print(f"[inhouse] {url}")
+                print(f"  body={body[:300]}")
+                try:
+                    data = json.loads(body)
+                    itms_data = data.get("data", "")
+                    if "itms-services" in str(itms_data):
+                        itms_url = itms_data
+                        print(f"  >> ITMS: {itms_url}")
                 except Exception as e:
                     print(f"  err: {e}")
 
