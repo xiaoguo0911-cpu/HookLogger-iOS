@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import asyncio, sys, os, json, re, urllib.request, urllib.parse
+import asyncio, sys, os, json, re, urllib.request, urllib.parse, plistlib
 from playwright.async_api import async_playwright
 
 TARGET = "https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy"
@@ -26,6 +26,21 @@ async def main():
                 });
                 return _s.apply(this,arguments);
             };
+            // 捕获所有字符串赋值给 location.href
+            window.__locHref = [];
+            const _locDesc = Object.getOwnPropertyDescriptor(window.Location.prototype, 'href');
+            if (_locDesc) {
+                Object.defineProperty(window.Location.prototype, 'href', {
+                    get: _locDesc.get,
+                    set: function(v) {
+                        if (typeof v === 'string') window.__locHref.push(v);
+                        if (!v || !v.toString().includes('itms')) {
+                            _locDesc.set.call(this, v);
+                        }
+                    },
+                    configurable: true
+                });
+            }
         """)
         page = await context.new_page()
 
@@ -35,18 +50,16 @@ async def main():
             await route.abort()
         await page.route("itms-services://**", on_itms)
 
-        # 直接访问原始 URL，让它自动跳转到最新的 CF 域名
         print(f"goto {TARGET}")
         try:
             await page.goto(TARGET, wait_until="load", timeout=30000)
         except Exception as e:
-            print(f"goto err: {e}")
+            print(f"goto: {e}")
 
-        print(f"after goto: {page.url}")
+        await asyncio.sleep(25)  # 多等一会
 
-        # 等待 CF 页面的 API 调用
-        await asyncio.sleep(20)
-        print(f"final url: {page.url}")
+        final_url = page.url
+        print(f"final: {final_url}")
 
         xhr = await page.evaluate("()=>window.__log||[]")
         dk = None
@@ -60,30 +73,67 @@ async def main():
                 try: enc_data = json.loads(e['resp']).get('data','')
                 except: pass
 
-        print(f"dk={dk}")
-        print(f"enc_data={enc_data[:50] if enc_data else None}")
-        print(f"itms_urls={itms_urls}")
+        loc_hrefs = await page.evaluate("()=>window.__locHref||[]")
+        print(f"loc hrefs: {loc_hrefs}")
+        print(f"itms: {itms_urls}")
+        print(f"dk: {dk}")
 
-        if enc_data:
-            # 在页面中调用解密函数
-            dec = await page.evaluate("""(encData) => {
-                const results = [];
-                for (const k of Object.keys(window)) {
-                    if (typeof window[k] !== 'function') continue;
-                    try {
-                        // 尝试用不同 key 调用所有可能的解密函数
-                        for (const key of ['1cfhnSTQ1T3tLpjtE', '5bhabw', 'com.Jiaqi.RetryP', '']) {
-                            const r = window[k](encData, key);
-                            if (r && typeof r === 'string' && r.includes('itms')) {
-                                results.push({func: k, key, r: r.slice(0,300)});
-                            }
-                        }
-                    } catch(e) {}
-                }
-                return results;
-            }""", enc_data)
-            print(f"decrypt results: {dec}")
+        # 找所有以 itms 开头的字符串（从任何变量）
+        all_itms = await page.evaluate("""() => {
+            const found = [];
+            function check(v) {
+                if (typeof v === 'string' && v.includes('itms-services')) found.push(v.slice(0,500));
+            }
+            // 检查 localStorage, sessionStorage
+            try { for(let i=0;i<localStorage.length;i++) check(localStorage.getItem(localStorage.key(i))); } catch(e) {}
+            try { for(let i=0;i<sessionStorage.length;i++) check(sessionStorage.getItem(sessionStorage.key(i))); } catch(e) {}
+            // 检查所有全局 string 变量
+            for (const k of Object.keys(window)) {
+                try { check(window[k]); } catch(e) {}
+            }
+            return found;
+        }""")
+        print(f"all itms strings: {all_itms}")
+
+        if not (itms_urls or all_itms or loc_hrefs):
+            # 最后手段：取得所有 a 元素的 href 
+            links = await page.evaluate("""() => 
+                Array.from(document.querySelectorAll('a,canvas,[href]')).map(e => ({
+                    tag:e.tagName, href:e.href||'', text:e.innerText||''
+                })).filter(e => e.href || e.text)
+            """)
+            print(f"links: {links[:10]}")
 
         await browser.close()
+
+    # 处理找到的 itms URL
+    found = itms_urls + all_itms + loc_hrefs
+    found = [u for u in found if 'itms-services' in str(u)]
+    print(f"\nfound itms: {found}")
+
+    if found:
+        itms = found[0]
+        m = re.search(r'url=([^&\s"]+)', itms)
+        if m:
+            plist_url = urllib.parse.unquote(m.group(1))
+            print(f"plist: {plist_url}")
+            r = urllib.request.urlopen(urllib.request.Request(plist_url, headers={"User-Agent": UA}), timeout=15)
+            p = plistlib.loads(r.read())
+            for a in p.get('items',[{}])[0].get('assets',[]):
+                if a.get('kind')=='software-package':
+                    ipa_url = a['url']
+                    print(f"IPA URL: {ipa_url}")
+                    r2 = urllib.request.urlopen(urllib.request.Request(ipa_url, headers={"User-Agent": UA}), timeout=300)
+                    total = int(r2.headers.get("Content-Length",0))
+                    done = 0
+                    with open("/tmp/downloaded.ipa","wb") as f:
+                        while True:
+                            c = r2.read(65536)
+                            if not c: break
+                            f.write(c); done += len(c)
+                            if total: print(f"{done*100//total}%", end="\r", flush=True)
+                    print(f"\nDone: {os.path.getsize('/tmp/downloaded.ipa'):,} bytes")
+    else:
+        print("no itms found"); sys.exit(1)
 
 asyncio.run(main())
