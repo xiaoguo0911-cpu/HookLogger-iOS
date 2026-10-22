@@ -1,0 +1,28 @@
+name: Get IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Target URL'
+        required: true
+        default: 'https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy'
+
+jobs:
+  run:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: pip3 install playwright pycryptodome --quiet && playwright install webkit
+      - name: Run
+        env:
+          TARGET_URL: ${{ github.event.inputs.url || 'https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy' }}
+        run: python3 scripts/dl_ipa.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa-${{ github.run_number }}
+          path: /tmp/downloaded.ipa
+          retention-days: 7
