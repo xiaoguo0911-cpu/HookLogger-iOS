@@ -7,8 +7,6 @@ BASE = "https://doe29x10dqvat.cloudfront.net"
 APPID = "1cfhnSTQ1T3tLpjtE"
 
 async def main():
-    itms_urls = []
-
     async with async_playwright() as p:
         browser = await p.webkit.launch(headless=True)
         context = await browser.new_context(
@@ -19,7 +17,6 @@ async def main():
             Object.defineProperty(navigator,'platform',{get:()=>'iPhone'});
             Object.defineProperty(navigator,'maxTouchPoints',{get:()=>5});
             window.__log=[];
-            window.__itms=[];
             const _o=XMLHttpRequest.prototype.open,_s=XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open=function(m,u){this._u=u;return _o.apply(this,arguments)};
             XMLHttpRequest.prototype.send=function(b){
@@ -29,102 +26,79 @@ async def main():
                 });
                 return _s.apply(this,arguments);
             };
-            // 最重要: 拦截 window.location.href 赋值
-            let _origHref = Object.getOwnPropertyDescriptor(window.Location.prototype, 'href') || 
-                            {get: function(){return window.location.href}, set: function(v){window.location.href=v}};
-            try {
-                Object.defineProperty(window.Location.prototype, 'href', {
-                    get: _origHref.get,
-                    set: function(v) {
-                        console.log('[LOC HREF]', v);
-                        window.__itms.push(v);
-                        if(!v.includes('itms')) {
-                            _origHref.set.call(this, v);
-                        }
-                    }
-                });
-            } catch(e) {}
-            // 也拦截 document.location
-            // 拦截 open() 和 location.assign
-            const origAssign = window.location.assign;
-            window.location.assign = function(url) {
-                console.log('[ASSIGN]', url);
-                window.__itms.push(url);
-                if(!url.includes('itms')) return origAssign.call(this, url);
-            };
-            // 拦截 <a> 标签点击
-            document.addEventListener('click', function(e) {
-                const a = e.target.closest('a');
-                if(a && a.href && a.href.includes('itms')) {
-                    e.preventDefault();
-                    console.log('[A CLICK]', a.href);
-                    window.__itms.push(a.href);
-                }
-            }, true);
         """)
-
         page = await context.new_page()
-        console_logs = []
-        page.on("console", lambda m: console_logs.append(m.text))
-
-        # 拦截 itms 请求
+        itms_urls = []
         async def on_itms(route):
             itms_urls.append(route.request.url)
-            print(f"[ROUTE ITMS] {route.request.url}")
+            print(f"[ITMS] {route.request.url}")
             await route.abort()
         await page.route("itms-services://**", on_itms)
-
-        print("loading page...")
         await page.goto(BASE+"/"+APPID, wait_until="networkidle", timeout=30000)
         await asyncio.sleep(20)
 
-        # 读取
-        console_itms = [m for m in console_logs if 'itms' in m.lower() or 'ASSIGN' in m or 'LOC HREF' in m]
-        print(f"console itms: {console_itms}")
-
-        window_itms = await page.evaluate("()=>window.__itms||[]")
-        print(f"window.__itms: {window_itms}")
-
-        # 找所有 a[href] 包含 itms
-        links = await page.evaluate("""()=>{
-            return Array.from(document.querySelectorAll('a')).map(a=>a.href).filter(h=>h.includes('itms'));
+        # 从 React fiber 深度搜索所有 itms 相关字符串
+        result = await page.evaluate("""() => {
+            const found = [];
+            function search(obj, depth) {
+                if (depth > 20 || !obj) return;
+                if (typeof obj === 'string' && obj.includes('itms-services')) {
+                    found.push(obj.slice(0, 500));
+                    return;
+                }
+                if (typeof obj !== 'object') return;
+                for (const k of Object.keys(obj).slice(0, 50)) {
+                    try { search(obj[k], depth + 1); } catch(e) {}
+                }
+            }
+            // 搜索 React root
+            try {
+                const root = document.querySelector('#root, [data-reactroot]');
+                if (root) {
+                    const k = Object.keys(root).find(k => k.startsWith('__react') || k.startsWith('__fiber'));
+                    if (k) {
+                        const queue = [root[k]];
+                        const visited = new WeakSet();
+                        while (queue.length > 0 && found.length === 0) {
+                            const node = queue.shift();
+                            if (!node || visited.has(node)) continue;
+                            visited.add(node);
+                            // 检查 memoizedState
+                            if (node.memoizedState) {
+                                let s = node.memoizedState;
+                                while (s) {
+                                    if (s.memoizedState) search(s.memoizedState, 0);
+                                    s = s.next;
+                                }
+                            }
+                            // 检查 memoizedProps
+                            if (node.memoizedProps) search(node.memoizedProps, 0);
+                            if (node.child) queue.push(node.child);
+                            if (node.sibling) queue.push(node.sibling);
+                        }
+                    }
+                }
+            } catch(e) { return 'err: ' + e.message; }
+            return found;
         }""")
-        print(f"itms links: {links}")
+        print(f"React fiber itms: {result}")
 
-        # 查看 DOM 状态
-        body = await page.evaluate("()=>document.body.innerHTML.slice(0,2000)")
-        print(f"body: {body[:500]}")
+        # 也搜索整个 window 对象
+        win_result = await page.evaluate("""() => {
+            const found = [];
+            for (const k of Object.getOwnPropertyNames(window)) {
+                try {
+                    const v = window[k];
+                    if (typeof v === 'string' && v.includes('itms-services')) found.push(v.slice(0,500));
+                    if (typeof v === 'object' && v !== null && JSON.stringify(v).includes('itms-services'))
+                        found.push(k + ': ...');
+                } catch(e) {}
+            }
+            return found;
+        }""")
+        print(f"window itms: {win_result}")
 
-        # 查看所有 XHR 里的 inhouse 响应
-        xhr = await page.evaluate("()=>window.__log||[]")
-        for e in xhr:
-            print(f"XHR [{e['status']}] {e['url']}")
-
+        print(f"route itms: {itms_urls}")
         await browser.close()
-
-    all_itms = itms_urls + window_itms + links
-    print(f"\nAll itms: {all_itms}")
-
-    if all_itms:
-        itms = all_itms[0]
-        m = re.search(r'url=([^&\s"]+)', itms)
-        if m:
-            plist_url = urllib.parse.unquote(m.group(1))
-            print(f"plist: {plist_url}")
-            r = urllib.request.urlopen(urllib.request.Request(plist_url, headers={"User-Agent": UA}), timeout=15)
-            p = plistlib.loads(r.read())
-            for a in p.get('items',[{}])[0].get('assets',[]):
-                if a.get('kind')=='software-package':
-                    ipa_url = a['url']
-                    print(f"IPA: {ipa_url}")
-                    r2 = urllib.request.urlopen(urllib.request.Request(ipa_url, headers={"User-Agent": UA}), timeout=300)
-                    with open("/tmp/downloaded.ipa","wb") as f:
-                        while True:
-                            c = r2.read(65536)
-                            if not c: break
-                            f.write(c)
-                    print(f"Done: {os.path.getsize('/tmp/downloaded.ipa'):,} bytes")
-    else:
-        print("no itms found"); sys.exit(1)
 
 asyncio.run(main())
