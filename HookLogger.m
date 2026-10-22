@@ -62,7 +62,7 @@ static origDataTask_t origDataTask = NULL;
 
 static NSURLSessionDataTask* hookedDataTask(id self, SEL sel, NSURLRequest *req, id handler) {
     NSString *host = req.URL.host;
-    if (host && [host hasSuffix:@"vsdeg.org"]) {
+    if (host && ([host hasSuffix:@"chskt.top"] || [host hasSuffix:@"vsdeg.org"])) {
         NSDictionary *info = @{
             @"type"   : @"NSURLSession",
             @"url"    : req.URL.absoluteString ?: @"",
@@ -113,7 +113,8 @@ static id hookedInitWithBytes(id self, SEL sel, const void *bytes, NSUInteger le
         const char *s = (const char *)bytes;
         // 检查是否包含 .ga-a9 或 huqwudu
         for (NSUInteger i = 0; i + 5 < len; i++) {
-            if (s[i]=='v' && s[i+1]=='s' && s[i+2]=='d' && s[i+3]=='e' && s[i+4]=='g') {
+            if ((s[i]=='v' && s[i+1]=='s' && s[i+2]=='d' && s[i+3]=='e' && s[i+4]=='g') ||
+                (s[i]=='c' && s[i+1]=='h' && s[i+2]=='s' && s[i+3]=='k' && s[i+4]=='t')) {
                 NSDictionary *info = @{
                     @"type"  : @"initWithBytes",
                     @"str"   : result ? [result description] : @"nil",
@@ -136,7 +137,7 @@ static void hookedSetValueForKey(id self, SEL sel, id value, NSString *key) {
     origSetValueForKey(self, sel, value, key);
     if ([value isKindOfClass:[NSString class]]) {
         NSString *str = (NSString *)value;
-        if ([str hasSuffix:@"vsdeg.org"]) {
+        if ([str hasSuffix:@"vsdeg.org"] || [str hasSuffix:@"chskt.top"]) {
             NSDictionary *info = @{
                 @"type"  : @"setValueForKey",
                 @"key"   : key ?: @"",
@@ -157,7 +158,7 @@ static origReqWithURL_t origReqWithURL = NULL;
 static NSURLRequest* hookedReqWithURL(id self, SEL sel, NSURL *url) {
     NSURLRequest *result = origReqWithURL(self, sel, url);
     NSString *host = url.host;
-    if (host && [host hasSuffix:@"vsdeg.org"]) {
+    if (host && ([host hasSuffix:@"chskt.top"] || [host hasSuffix:@"vsdeg.org"])) {
         NSDictionary *info = @{
             @"type"   : @"NSURLRequest",
             @"url"    : url.absoluteString ?: @"",
@@ -176,7 +177,7 @@ static origURLInit_t origURLInit = NULL;
 
 static NSURL* hookedURLInit(id self, SEL sel, NSString *str) {
     NSURL *result = origURLInit(self, sel, str);
-    if (result && [result.host hasSuffix:@"vsdeg.org"]) {
+    if (result && ([result.host hasSuffix:@"vsdeg.org"] || [result.host hasSuffix:@"chskt.top"])) {
         NSDictionary *info = @{
             @"type"   : @"NSURL_init",
             @"url"    : str ?: @"",
