@@ -15,12 +15,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup mitmproxy
+      - name: Setup mitmproxy via pipx
         run: |
-          pip3 install mitmproxy --break-system-packages --quiet
-          mitmdump -p 8080 --save-stream-file /tmp/traffic.mitm &
+          pipx install mitmproxy
+          pipx run mitmdump --version
+          pipx run mitmdump -p 8080 --save-stream-file /tmp/traffic.mitm &
           echo $! > /tmp/mitm.pid
-          sleep 3
+          sleep 4
           echo "mitmproxy started"
 
       - name: Boot iOS Simulator
@@ -30,23 +31,28 @@ jobs:
           echo "SIM_ID=$SIM_ID" >> $GITHUB_ENV
           xcrun simctl boot "$SIM_ID" || true
           sleep 8
-          echo "Simulator booted"
 
-      - name: Install mitmproxy CA cert
+      - name: Install mitmproxy CA cert in Simulator
         run: |
-          CERT="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
-          ls ~/.mitmproxy/ || echo "no .mitmproxy dir"
+          CERT="$HOME/.local/pipx/venvs/mitmproxy/lib/python*/site-packages/mitmproxy/certs/mitmproxy-ca-cert.pem"
+          CERT=$(ls $HOME/.local/pipx/venvs/mitmproxy/lib/*/site-packages/mitmproxy/certs/mitmproxy-ca-cert.pem 2>/dev/null | head -1)
+          echo "cert path: $CERT"
           if [ -f "$CERT" ]; then
             xcrun simctl keychain "$SIM_ID" add-root-cert "$CERT" && echo "cert installed"
+          else
+            echo "cert not found, checking ~/.mitmproxy"
+            ls ~/.mitmproxy/ 2>/dev/null || echo "no dir"
+            CERT="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+            [ -f "$CERT" ] && xcrun simctl keychain "$SIM_ID" add-root-cert "$CERT" && echo "cert installed from ~/.mitmproxy"
           fi
 
-      - name: Open URL in Simulator
+      - name: Open URL in iOS Simulator
         run: |
           xcrun simctl openurl "$SIM_ID" "${{ github.event.inputs.target_url }}"
-          echo "URL opened, waiting..."
-          sleep 30
+          echo "URL opened, waiting 35s for auto-download..."
+          sleep 35
 
-      - name: Extract IPA
+      - name: Extract IPA from traffic
         run: |
           kill $(cat /tmp/mitm.pid) 2>/dev/null || true
           sleep 2
