@@ -15,7 +15,6 @@ async def main():
             Object.defineProperty(navigator,'platform',{get:()=>'iPhone'});
             Object.defineProperty(navigator,'maxTouchPoints',{get:()=>5});
             window.__log=[];
-            window.__decLog=[];  // 解密日志
             const _o=XMLHttpRequest.prototype.open,_s=XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open=function(m,u){this._u=u;return _o.apply(this,arguments)};
             XMLHttpRequest.prototype.send=function(b){
@@ -25,35 +24,14 @@ async def main():
                 });
                 return _s.apply(this,arguments);
             };
-            // 拦截所有函数调用，找返回 itms URL 的那个
-            // 重写 String.prototype.startsWith 来检测
-            const _origSW = String.prototype.startsWith;
-            String.prototype.startsWith = function(prefix) {
-                const result = _origSW.call(this, prefix);
-                if(prefix && prefix.includes('itms-services') && this.length > 10) {
-                    window.__decLog.push({
-                        input: this.slice(0, 300),
-                        prefix: prefix,
-                        result: result
-                    });
-                    console.log('[startsWith itms]', this.slice(0, 300), '|', prefix, '|', result);
-                }
-                return result;
-            };
-            // 也拦截 includes 检查 itms
-            const _origInc = String.prototype.includes;
-            String.prototype.includes = function(s) {
-                if(s && s.includes('itms') && this.length > 10) {
-                    window.__decLog.push({type:'includes', str: this.slice(0,300), search: s});
-                }
-                return _origInc.call(this, s);
-            };
         """)
         page = await context.new_page()
+        console_logs = []
+        page.on("console", lambda m: console_logs.append(m.text))
 
         async def on_itms(route):
             itms_urls.append(route.request.url)
-            print(f"[ITMS ROUTE] {route.request.url}")
+            print(f"[ITMS] {route.request.url}")
             await route.abort()
         await page.route("itms-services://**", on_itms)
 
@@ -63,61 +41,67 @@ async def main():
 
         await asyncio.sleep(20)
 
-        # 找安装按钮并点击
+        # 找按钮
         btns = await page.query_selector_all("button")
+        print(f"buttons: {len(btns)}")
+        install_btn = None
         for btn in btns:
             txt = await btn.inner_text()
-            if '安装' in txt and len(txt) < 5:
-                print(f"Clicking: '{txt}'")
-                await btn.click()
-                break
+            print(f"  btn: {repr(txt)}")
+            if txt.strip() == '安装':
+                install_btn = btn
 
-        await asyncio.sleep(8)
-
-        dec_log = await page.evaluate("()=>window.__decLog||[]")
+        # 拿 downloadKey
         xhr = await page.evaluate("()=>window.__log||[]")
-
-        print(f"dec_log: {dec_log[:5]}")
-        print(f"itms: {itms_urls}")
-
-        # 从 dec_log 找 itms URL
-        for entry in dec_log:
-            s = entry.get('input','') or entry.get('str','')
-            if 'itms-services' in s:
-                itms_url = s
-                print(f"FOUND itms: {itms_url}")
-                itms_urls.append(itms_url)
-
-        # 也找 inhouse 响应
+        dk = None
+        enc_data = None
         for e in xhr:
-            if 'inhouse' in e['url']:
-                print(f"inhouse resp: {e['resp'][:200]}")
+            if 'getinfo' in e['url']:
+                try: dk = json.loads(e['resp'])['data']['downloadKey']
+                except: pass
 
+        print(f"dk: {dk}")
+
+        if install_btn and dk:
+            print("Clicking install button...")
+            await install_btn.click()
+            await asyncio.sleep(10)
+
+            # 再读 XHR
+            xhr2 = await page.evaluate("()=>window.__log||[]")
+            for e in xhr2:
+                if 'inhouse' in e['url']:
+                    try: enc_data = json.loads(e['resp']).get('data','')
+                    except: pass
+
+            print(f"enc_data after click: {enc_data[:50] if enc_data else None}")
+
+            # 在页面上直接调用解密函数
+            # 找所有接受 (string, string) 参数并返回包含 'itms' 的函数
+            result = await page.evaluate(f"""(dk) => {{
+                const found = [];
+                // 找 _0x3672a3 或类似的解密函数
+                // 暴力遍历所有全局 _0x 函数
+                for (const k of Object.keys(window)) {{
+                    if (typeof window[k] !== 'function') continue;
+                    try {{
+                        const r = window[k](
+                            "{enc_data or ''}", dk
+                        );
+                        if (r && typeof r === 'string' && r.length > 20) {{
+                            found.push({{k, r: r.slice(0,200)}});
+                            if (r.includes('itms')) {{
+                                return {{found: k, url: r.slice(0,500)}};
+                            }}
+                        }}
+                    }} catch(e) {{}}
+                }}
+                return {{tried: found.length, sample: found.slice(0,3)}};
+            }}""", dk)
+            print(f"decrypt search: {result}")
+
+        print(f"itms: {itms_urls}")
+        print(f"console: {console_logs[:5]}")
         await browser.close()
-
-    all_itms = [u for u in itms_urls if 'itms-services' in u]
-    if all_itms:
-        itms = all_itms[0]
-        m = re.search(r'url=([^&\s"]+)', itms)
-        if m:
-            plist_url = urllib.parse.unquote(m.group(1))
-            r = urllib.request.urlopen(urllib.request.Request(plist_url, headers={"User-Agent": UA}), timeout=15)
-            p = plistlib.loads(r.read())
-            for a in p.get('items',[{}])[0].get('assets',[]):
-                if a.get('kind')=='software-package':
-                    ipa_url = a['url']
-                    print(f"IPA: {ipa_url}")
-                    r2 = urllib.request.urlopen(urllib.request.Request(ipa_url, headers={"User-Agent": UA}), timeout=300)
-                    total = int(r2.headers.get("Content-Length",0))
-                    done = 0
-                    with open("/tmp/downloaded.ipa","wb") as f:
-                        while True:
-                            c=r2.read(65536);
-                            if not c: break
-                            f.write(c); done+=len(c)
-                            if total: print(f"{done*100//total}%",end="\r",flush=True)
-                    print(f"\nDone: {os.path.getsize('/tmp/downloaded.ipa'):,} bytes")
-                    sys.exit(0)
-    print("no itms found"); sys.exit(1)
 
 asyncio.run(main())
