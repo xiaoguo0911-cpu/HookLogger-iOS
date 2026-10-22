@@ -15,52 +15,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup mitmproxy via pipx
-        run: |
-          pipx install mitmproxy
-          pipx run mitmdump --version
-          pipx run mitmdump -p 8080 --save-stream-file /tmp/traffic.mitm &
-          echo $! > /tmp/mitm.pid
-          sleep 4
-          echo "mitmproxy started"
-
       - name: Boot iOS Simulator
         run: |
-          SIM_ID=$(xcrun simctl list devices available | grep "iPhone" | grep -v "unavailable" | head -1 | grep -oE '[0-9A-F-]{36}')
+          SIM_ID=$(xcrun simctl list devices available | grep "iPhone 1" | grep -v "unavailable" | head -1 | grep -oE '[0-9A-F-]{36}')
           echo "SIM_ID=$SIM_ID"
           echo "SIM_ID=$SIM_ID" >> $GITHUB_ENV
           xcrun simctl boot "$SIM_ID" || true
-          sleep 8
+          sleep 10
+          echo "Simulator booted"
 
-      - name: Install mitmproxy CA cert in Simulator
+      - name: Open URL and wait for download
         run: |
-          CERT="$HOME/.local/pipx/venvs/mitmproxy/lib/python*/site-packages/mitmproxy/certs/mitmproxy-ca-cert.pem"
-          CERT=$(ls $HOME/.local/pipx/venvs/mitmproxy/lib/*/site-packages/mitmproxy/certs/mitmproxy-ca-cert.pem 2>/dev/null | head -1)
-          echo "cert path: $CERT"
-          if [ -f "$CERT" ]; then
-            xcrun simctl keychain "$SIM_ID" add-root-cert "$CERT" && echo "cert installed"
-          else
-            echo "cert not found, checking ~/.mitmproxy"
-            ls ~/.mitmproxy/ 2>/dev/null || echo "no dir"
-            CERT="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
-            [ -f "$CERT" ] && xcrun simctl keychain "$SIM_ID" add-root-cert "$CERT" && echo "cert installed from ~/.mitmproxy"
-          fi
+          URL="${{ github.event.inputs.target_url }}"
+          echo "Opening: $URL"
+          xcrun simctl openurl "$SIM_ID" "$URL"
+          echo "Waiting 40s for auto-download..."
+          sleep 40
 
-      - name: Open URL in iOS Simulator
+      - name: Find downloaded IPA in simulator
         run: |
-          xcrun simctl openurl "$SIM_ID" "${{ github.event.inputs.target_url }}"
-          echo "URL opened, waiting 35s for auto-download..."
-          sleep 35
+          SIM_DATA="$HOME/Library/Developer/CoreSimulator/Devices/$SIM_ID"
+          echo "Simulator data: $SIM_DATA"
+          
+          echo "=== Recently downloaded files ==="
+          find "$SIM_DATA" -name "*.ipa" -newer /tmp -ls 2>/dev/null || echo "no .ipa files"
+          find "$SIM_DATA" -name "*.zip" -newer /tmp -ls 2>/dev/null | head -5
+          
+          echo "=== Downloads folder ==="
+          find "$SIM_DATA" -path "*/Downloads/*" -ls 2>/dev/null | head -20
+          
+          echo "=== Staged app files ==="
+          find "$SIM_DATA" -name "*.app" -type d 2>/dev/null | head -10
+          
+          echo "=== All files modified in last 2 min ==="
+          find "$SIM_DATA" -newer /tmp -type f 2>/dev/null | grep -v "\.log\|\.db\|sqlite\|\.DS_Store" | head -30
 
-      - name: Extract IPA from traffic
+      - name: Check Safari downloads
         run: |
-          kill $(cat /tmp/mitm.pid) 2>/dev/null || true
-          sleep 2
-          python3 scripts/sim_extract.py
+          SIM_DATA="$HOME/Library/Developer/CoreSimulator/Devices/$SIM_ID"
+          
+          # Safari downloads
+          find "$SIM_DATA" -path "*Safari*" -type f 2>/dev/null | head -20
+          
+          # Mobile install staging
+          find "$SIM_DATA" -path "*staged_installer*" -type d 2>/dev/null | head -5
+          find "$SIM_DATA" -path "*install*" -name "*.ipa" 2>/dev/null | head -5
 
-      - name: Upload IPA
+      - name: Upload any found IPA
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ipa-${{ github.run_number }}
-          path: /tmp/downloaded.ipa
+          path: |
+            /tmp/downloaded.ipa
+            ~/Library/Developer/CoreSimulator/Devices/${{ env.SIM_ID }}/**/*.ipa
           retention-days: 7
