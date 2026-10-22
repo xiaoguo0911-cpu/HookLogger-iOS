@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import asyncio, sys, os, json, re
+import asyncio, sys, os, json
 import urllib.request
 from playwright.async_api import async_playwright
 
@@ -13,33 +13,25 @@ async def main():
         browser = await p.webkit.launch(headless=True)
         context = await browser.new_context(user_agent=UA)
 
-        # 注入 XHR 拦截器到所有页面
         await context.add_init_script("""
             window.__xhrLog = [];
             const _origOpen = XMLHttpRequest.prototype.open;
             const _origSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url) {
                 this.__xhrUrl = url;
-                this.__xhrMethod = method;
                 return _origOpen.apply(this, arguments);
             };
             XMLHttpRequest.prototype.send = function(body) {
-                const xhr = this;
-                const url = xhr.__xhrUrl;
-                const origOnLoad = xhr.onload;
-                const origOnReadyStateChange = xhr.onreadystatechange;
-                
-                function captureResp() {
-                    if (xhr.readyState === 4) {
+                const self = this;
+                this.addEventListener('readystatechange', function() {
+                    if (self.readyState === 4) {
                         window.__xhrLog.push({
-                            url: url,
-                            status: xhr.status,
-                            resp: xhr.responseText ? xhr.responseText.substring(0, 2000) : ''
+                            url: self.__xhrUrl || '',
+                            status: self.status,
+                            resp: self.responseText ? self.responseText.substring(0, 3000) : ''
                         });
                     }
-                }
-                
-                xhr.addEventListener('readystatechange', captureResp);
+                });
                 return _origSend.apply(this, arguments);
             };
         """)
@@ -50,64 +42,71 @@ async def main():
         try:
             await page.goto(TARGET, wait_until="load", timeout=30000)
         except Exception as e:
-            print(f"goto: {e}")
+            print(f"  goto: {e}")
 
-        # 等待 XHR 完成
-        print("waiting 20s for XHR...")
-        await asyncio.sleep(20)
+        # 等待重定向到 CloudFront
+        print(f"current url: {page.url}")
+        try:
+            await page.wait_for_url("*cloudfront*", timeout=15000)
+            print(f"redirected to: {page.url}")
+        except Exception as e:
+            print(f"  wait_for_url: {e}")
+            print(f"  current url: {page.url}")
 
-        # 读取所有 XHR 日志
+        # 等待 API 调用完成
+        print("waiting 15s...")
+        await asyncio.sleep(15)
+
+        current_url = page.url
+        print(f"final url: {current_url}")
+
+        # 读 XHR log
         xhr_log = await page.evaluate("() => window.__xhrLog || []")
         print(f"\n=== XHR LOG ({len(xhr_log)}) ===")
         download_key = None
         for entry in xhr_log:
             print(f"[{entry.get('status')}] {entry.get('url')}")
-            resp_text = entry.get('resp', '')
-            if resp_text:
-                print(f"  {resp_text[:300]}")
-            if 'getinfo' in str(entry.get('url', '')) and 'downloadKey' in resp_text:
+            resp = entry.get('resp', '')
+            print(f"  {resp[:200]}")
+            if 'downloadKey' in resp:
                 try:
-                    data = json.loads(resp_text)
-                    download_key = data['data']['downloadKey']
+                    d = json.loads(resp)
+                    download_key = d['data']['downloadKey']
                     print(f"  => downloadKey: {download_key}")
                 except:
                     pass
 
         if not download_key:
-            print("[!] 未找到 downloadKey")
+            print("[!] 未找到 downloadKey，退出")
             sys.exit(1)
 
-        # 在页面中直接调用下载 API
-        print(f"\n[*] 尝试下载 APIs with downloadKey={download_key}")
-
-        apis = [
-            ("POST", f"{BASE}/clientapi/app/install",
-             json.dumps({"appid": APPID, "downloadKey": download_key, "lang": "zh_CN"})),
-            ("GET", f"{BASE}/clientapi/app/install?appid={APPID}&downloadKey={download_key}", ""),
-            ("POST", f"{BASE}/clientapi/app/getdownload",
-             json.dumps({"appid": APPID, "downloadKey": download_key})),
-            ("GET", f"{BASE}/clientapi/app/getdownload?appid={APPID}&downloadKey={download_key}", ""),
-            ("GET", f"{BASE}/clientapi/app/plist?appid={APPID}&downloadKey={download_key}", ""),
-            ("POST", f"{BASE}/clientapi/app/download",
-             json.dumps({"appid": APPID, "downloadKey": download_key})),
-        ]
-
-        for method, url, body in apis:
+        # 用页面内 fetch 试各种 API
+        print(f"\n[*] 尝试下载 APIs...")
+        for method, path, body in [
+            ("POST", "/clientapi/app/install", json.dumps({"appid": APPID, "downloadKey": download_key, "lang": "zh_CN"})),
+            ("GET", f"/clientapi/app/install?appid={APPID}&downloadKey={download_key}", ""),
+            ("POST", "/clientapi/app/getdownloadurl", json.dumps({"appid": APPID, "downloadKey": download_key})),
+            ("GET", f"/clientapi/app/getdownloadurl?appid={APPID}&downloadKey={download_key}", ""),
+            ("GET", f"/clientapi/app/plist?appid={APPID}&downloadKey={download_key}", ""),
+            ("POST", "/clientapi/app/download", json.dumps({"appid": APPID, "downloadKey": download_key})),
+            ("GET", f"/clientapi/app/download?appid={APPID}&downloadKey={download_key}", ""),
+        ]:
+            url = BASE + path
             try:
-                js = f"""
-                async () => {{
-                    const opts = {{method: '{method}', headers: {{'Content-Type': 'application/json'}}}};
-                    {'opts.body = JSON.stringify(' + json.dumps(json.loads(body)) + ');' if body else ''}
-                    const r = await fetch('{url}', opts);
-                    return {{status: r.status, body: await r.text()}};
-                }}
-                """
-                result = await page.evaluate(js)
-                print(f"  [{result['status']}] {method} {url}")
+                js_body = f"opts.body = {repr(body)};" if body else ""
+                result = await page.evaluate(f"""
+                    async () => {{
+                        const opts = {{method: '{method}', headers: {{'Content-Type':'application/json'}}}};
+                        {js_body}
+                        const r = await fetch('{url}', opts);
+                        return {{status: r.status, body: (await r.text()).substring(0, 400)}};
+                    }}
+                """)
+                print(f"  [{result['status']}] {method} {path}")
                 if result['body']:
-                    print(f"    {result['body'][:300]}")
+                    print(f"    {result['body']}")
             except Exception as e:
-                print(f"  [ERR] {url}: {e}")
+                print(f"  [ERR] {path}: {e}")
 
         await browser.close()
 
