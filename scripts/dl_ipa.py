@@ -14,11 +14,13 @@ def extract_ipa_url(plist_xml):
         ch = list(node)
         for i, c in enumerate(ch):
             if c.tag == "key" and c.text == "url": return ch[i+1].text
-            r = find(c)
+            r = find(c); 
             if r: return r
     return find(root)
 
 async def main():
+    itms_caught = []
+
     async with async_playwright() as p:
         browser = await p.webkit.launch(headless=True)
         context = await browser.new_context(
@@ -29,17 +31,6 @@ async def main():
             Object.defineProperty(navigator, 'platform', {get: () => 'iPhone'});
             Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 5});
             window.__xhrLog = [];
-            window.__itmsUrl = null;
-            // 拦截 location.href 赋值
-            const origDesc = Object.getOwnPropertyDescriptor(window.Location.prototype, 'href') ||
-                             Object.getOwnPropertyDescriptor(window, 'location');
-            const _origAssign = window.location.assign.bind(window.location);
-            window.location.assign = function(url) {
-                console.log('[assign]', url);
-                if (url && url.includes('itms')) { window.__itmsUrl = url; return; }
-                return _origAssign(url);
-            };
-            // 拦截 XHR
             const _o = XMLHttpRequest.prototype.open;
             const _s = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(m, u) { this._u = u; return _o.apply(this, arguments); };
@@ -53,31 +44,24 @@ async def main():
         """)
 
         page = await context.new_page()
+
+        # 拦截 itms-services 协议
+        async def handle_itms(route):
+            url = route.request.url
+            itms_caught.append(url)
+            print(f"[ITMS] {url}")
+            await route.abort()
+
+        await page.route("itms-services://**", handle_itms)
+
         console_logs = []
         page.on("console", lambda m: console_logs.append(m.text))
 
-        # 拦截导航到 itms-services
-        itms_caught = []
-        async def handle_route(route):
-            url = route.request.url
-            if 'itms-services' in url:
-                itms_caught.append(url)
-                print(f"[ITMS CAUGHT] {url}")
-            await route.abort()
-        await page.route("**", handle_route)
-        await page.unroute("https://**")  # 只拦截非 https
-
+        print("goto REFERER...")
         await page.goto(REFERER, wait_until="commit", timeout=10000)
         await asyncio.sleep(1)
 
-        # 恢复正常路由，只拦截 itms
-        await page.unroute("**")
-        await page.route("itms-services://**", lambda route: (
-            itms_caught.append(route.request.url) or
-            asyncio.get_event_loop().create_task(route.abort())
-        ))
-
-        print("goto CloudFront...")
+        print("goto CF...")
         try:
             await page.goto(CF_URL, wait_until="networkidle", timeout=30000)
         except Exception as e:
@@ -85,65 +69,99 @@ async def main():
 
         await asyncio.sleep(10)
 
-        # 检查控制台
-        print(f"Console logs: {console_logs[:10]}")
-        print(f"ITMS caught: {itms_caught}")
+        print(f"ITMS: {itms_caught}")
+        print(f"Console: {console_logs[:5]}")
 
-        # 简单找 itms
-        itms_from_window = await page.evaluate("() => window.__itmsUrl")
-        print(f"itms from window: {itms_from_window}")
-
-        # 在 DOM 里找 a[href] 和 canvas
-        dom_info = await page.evaluate("""() => ({
-            links: Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => h.length > 0),
-            canvases: document.querySelectorAll('canvas').length,
-            bodyText: document.body.innerText.slice(0, 200)
-        })""")
-        print(f"DOM: {json.dumps(dom_info, ensure_ascii=False)}")
-
-        # XHR
         xhr = await page.evaluate("() => window.__xhrLog")
-        print(f"XHR ({len(xhr)}):")
         download_key = None
         for e in xhr:
-            print(f"  [{e['status']}] {e['url']}")
+            print(f"XHR [{e['status']}] {e['url']}")
             if 'downloadKey' in e.get('resp', ''):
                 try: download_key = json.loads(e['resp'])['data']['downloadKey']
                 except: pass
 
         if not download_key:
-            print("no downloadKey"); sys.exit(1)
+            print("no DK"); sys.exit(1)
 
-        print(f"\ndownloadKey: {download_key}")
+        print(f"DK: {download_key}")
 
-        # 尝试从 canvas 数量推断二维码，然后在页面内找 itms URL
-        # 通过 window.__reactFiber 快速找
-        itms_from_react = await page.evaluate("""() => {
+        # React fiber BFS 找 itms URL
+        itms_react = await page.evaluate("""() => {
             try {
                 const root = document.getElementById('root');
-                if (!root) return 'no root';
+                if (!root) return 'no #root';
                 const k = Object.keys(root).find(k => k.startsWith('__react'));
-                if (!k) return 'no react key';
-                // 简单的 BFS 找 itms
+                if (!k) return 'no react key, keys=' + Object.keys(root).slice(0,5).join(',');
                 const queue = [root[k]];
-                let count = 0;
-                while (queue.length && count < 500) {
-                    count++;
-                    const node = queue.shift();
-                    if (!node) continue;
-                    if (node.memoizedProps) {
-                        const v = JSON.stringify(node.memoizedProps);
-                        if (v && v.includes('itms-services')) {
-                            return v.match(/itms-services:\/\/[^"'\s\\]+/)?.[0] || 'found but no match';
+                let i = 0;
+                while (queue.length && i < 2000) {
+                    i++;
+                    const n = queue.shift();
+                    if (!n) continue;
+                    if (n.memoizedState) {
+                        const s = n.memoizedState;
+                        // 找 queue 里的 itms
+                        if (s.queue && s.queue.dispatch) {
+                            // skip
+                        }
+                        if (s.memoizedState && typeof s.memoizedState === 'string' && s.memoizedState.includes('itms')) {
+                            return s.memoizedState;
                         }
                     }
-                    if (node.child) queue.push(node.child);
-                    if (node.sibling) queue.push(node.sibling);
+                    if (n.memoizedProps) {
+                        const p = n.memoizedProps;
+                        for (const pk of Object.keys(p)) {
+                            const v = p[pk];
+                            if (typeof v === 'string' && v.includes('itms-services')) return v;
+                        }
+                    }
+                    if (n.child) queue.push(n.child);
+                    if (n.sibling) queue.push(n.sibling);
                 }
-                return 'not found in ' + count + ' nodes';
-            } catch(e) { return 'err: ' + e.message; }
+                return 'searched ' + i + ' nodes, not found';
+            } catch(e) { return 'err: '+e.message; }
         }""")
-        print(f"itms from React: {itms_from_react}")
+        print(f"React itms: {itms_react}")
+
+        # 在 DOM 找 a 链接和 canvas
+        links = await page.evaluate("""() => ({
+            a: Array.from(document.querySelectorAll('a')).map(x=>x.href),
+            canvas: document.querySelectorAll('canvas').length,
+            txt: document.body.innerText.slice(0,300)
+        })""")
+        print(f"Links: {links['a']}")
+        print(f"Canvas: {links['canvas']}")
+        print(f"Text: {links['txt']}")
+
+        # 拿 itms 或 plist
+        itms_url = itms_caught[0] if itms_caught else None
+        if not itms_url and isinstance(itms_react, str) and itms_react.startswith('itms'):
+            itms_url = itms_react
+
+        if not itms_url:
+            print("[!] no itms URL found"); sys.exit(1)
+
+        print(f"\nitms URL: {itms_url}")
+        plist_url = re.search(r'url=([^&]+)', itms_url)
+        if plist_url:
+            plist_url = urllib.parse.unquote(plist_url.group(1))
+            print(f"plist URL: {plist_url}")
+            r = urllib.request.urlopen(urllib.request.Request(plist_url, headers={"User-Agent": UA}), timeout=15)
+            plist_xml = r.read().decode()
+            ipa_url = extract_ipa_url(plist_xml)
+            print(f"IPA URL: {ipa_url}")
+            if ipa_url:
+                out = "/tmp/downloaded.ipa"
+                r2 = urllib.request.urlopen(urllib.request.Request(ipa_url, headers={"User-Agent": UA}), timeout=300)
+                total = int(r2.headers.get("Content-Length", 0))
+                done = 0
+                with open(out, "wb") as f:
+                    while True:
+                        chunk = r2.read(65536)
+                        if not chunk: break
+                        f.write(chunk); done += len(chunk)
+                        if total: print(f"{done*100//total}%", end="\r", flush=True)
+                print(f"\nDone! {os.path.getsize(out):,} bytes")
 
         await browser.close()
 
