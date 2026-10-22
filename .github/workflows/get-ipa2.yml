@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install mitmproxy
-        run: pip3 install mitmproxy --break-system-packages --quiet
+        run: brew install mitmproxy
 
       - name: Start mitmproxy
         run: |
