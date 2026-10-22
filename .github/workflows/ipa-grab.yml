@@ -16,7 +16,7 @@ jobs:
 
       - name: Install deps
         run: |
-          pip3 install playwright --break-system-packages --quiet
+          pip3 install playwright pycryptodome --break-system-packages --quiet
           playwright install webkit
 
       - name: Run
