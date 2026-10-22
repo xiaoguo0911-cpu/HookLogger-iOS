@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-import asyncio, sys, os, json, re, urllib.request, urllib.parse, plistlib
+import asyncio, sys, os, json, re, urllib.request
 from playwright.async_api import async_playwright
 
 TARGET = "https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy"
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
 async def main():
-    itms_urls = []
     async with async_playwright() as p:
         browser = await p.webkit.launch(headless=True)
         ctx = await browser.new_context(user_agent=UA, viewport={"width":390,"height":844})
@@ -24,13 +23,12 @@ async def main():
                 });
                 return _s.apply(this,arguments);
             };
-            // 拦截 window.open
             const _origOpen = window.open;
-            window.open = function(url) {
-                console.log('[window.open]', url);
-                window.__opened.push(url || '');
+            window.open = function(url,target) {
+                console.log('[window.open]', url, target);
+                window.__opened.push(url||'');
                 if(url && url.includes('itms-services')) return null;
-                return _origOpen ? _origOpen.apply(this, arguments) : null;
+                return _origOpen ? _origOpen.call(this, url, target) : null;
             };
         """)
         page = await ctx.new_page()
@@ -38,8 +36,8 @@ async def main():
         page.on("console", lambda m: console_msgs.append(m.text))
 
         async def on_itms(r):
-            itms_urls.append(r.request.url)
             print(f"ITMS ROUTE: {r.request.url}")
+            window.__opened = [r.request.url]
             await r.abort()
         await page.route("itms-services://**", on_itms)
 
@@ -49,54 +47,96 @@ async def main():
             print(f"goto: {e}")
 
         await asyncio.sleep(20)
+
+        # 找所有 React root state
+        state = await page.evaluate("""() => {
+            const results = {};
+            try {
+                const root = document.getElementById('root');
+                if(!root) return {err:'no root'};
+                const k = Object.keys(root).find(k => k.startsWith('__react') || k.startsWith('__fiber'));
+                if(!k) return {err:'no fiber key'};
+                const fiber = root[k];
+                const queue = [fiber];
+                const seen = new WeakSet();
+                let count = 0;
+                while(queue.length > 0 && count < 500) {
+                    count++;
+                    const n = queue.shift();
+                    if(!n || seen.has(n)) continue;
+                    seen.add(n);
+                    if(n.memoizedState) {
+                        let s = n.memoizedState;
+                        while(s) {
+                            const v = s.memoizedState;
+                            if(v !== null && v !== undefined && typeof v === 'object' && v.xl) {
+                                results.found_xl = JSON.stringify(v).slice(0, 500);
+                            }
+                            if(typeof v === 'string' && v.length > 30 && (v.includes('itms') || v.includes('http'))) {
+                                results.str_state = v.slice(0,200);
+                            }
+                            s = s.next;
+                        }
+                    }
+                    if(n.child) queue.push(n.child);
+                    if(n.sibling) queue.push(n.sibling);
+                }
+                results.searched = count;
+            } catch(e) { results.err = e.message; }
+            return results;
+        }""")
+        print(f"state: {state}")
+
+        # 点击安装按钮
         btns = await page.query_selector_all("button")
-        print(f"Buttons: {len(btns)}")
         for btn in btns:
-            txt = await btn.inner_text()
-            if txt.strip() == "安装":
+            if (await btn.inner_text()).strip() == "安装":
                 print("Clicking install")
                 await btn.click()
                 break
 
         await asyncio.sleep(10)
 
+        # 读 opened 和 state after click
         opened = await page.evaluate("()=>window.__opened||[]")
-        xhr = await page.evaluate("()=>window.__log||[]")
-        print(f"window.open calls: {opened}")
-        print(f"ITMS route: {itms_urls}")
-        print(f"console: {[m for m in console_msgs if 'window.open' in m or 'itms' in m.lower()][:5]}")
+        print(f"opened: {opened}")
+        print(f"console: {[m for m in console_msgs if 'open' in m.lower() or 'itms' in m.lower()][:5]}")
 
-        for e in xhr:
-            if "inhouse" in e["url"]:
-                print(f"inhouse: {e['resp'][:100]}")
+        # 再检查 state
+        state2 = await page.evaluate("""() => {
+            const results = {};
+            try {
+                const root = document.getElementById('root');
+                const k = Object.keys(root).find(k => k.startsWith('__react'));
+                if(!k) return {err:'no fiber'};
+                const queue = [root[k]];
+                const seen = new WeakSet();
+                while(queue.length > 0) {
+                    const n = queue.shift();
+                    if(!n || seen.has(n)) continue;
+                    seen.add(n);
+                    if(n.memoizedState) {
+                        let s = n.memoizedState;
+                        while(s) {
+                            const v = s.memoizedState;
+                            if(v && typeof v === 'object' && (v.xl || v.helperLinks)) {
+                                results.data_obj = JSON.stringify(v).slice(0,500);
+                            }
+                            if(typeof v === 'string' && v.length > 20) {
+                                results.strings = results.strings || [];
+                                results.strings.push(v.slice(0,100));
+                            }
+                            s = s.next;
+                        }
+                    }
+                    if(n.child) queue.push(n.child);
+                    if(n.sibling) queue.push(n.sibling);
+                }
+            } catch(e) { results.err = e.message; }
+            return results;
+        }""")
+        print(f"state2: {json.dumps(state2, ensure_ascii=False)[:500]}")
 
         await browser.close()
-
-    all_itms = [u for u in (itms_urls + opened) if u and "itms-services" in u]
-    print(f"All itms: {all_itms}")
-    if all_itms:
-        itms = all_itms[0]
-        m = re.search(r"url=([^&\s\"]+)", itms)
-        if m:
-            plist_url = urllib.parse.unquote(m.group(1))
-            print(f"plist: {plist_url}")
-            r = urllib.request.urlopen(urllib.request.Request(plist_url,headers={"User-Agent":UA}), timeout=15)
-            p = plistlib.loads(r.read())
-            for a in p.get("items",[{}])[0].get("assets",[]):
-                if a.get("kind")=="software-package":
-                    ipa_url = a["url"]
-                    print(f"IPA: {ipa_url}")
-                    r2 = urllib.request.urlopen(urllib.request.Request(ipa_url,headers={"User-Agent":UA}), timeout=300)
-                    total = int(r2.headers.get("Content-Length",0))
-                    done = 0
-                    with open("/tmp/downloaded.ipa","wb") as f:
-                        while True:
-                            c=r2.read(65536)
-                            if not c: break
-                            f.write(c); done+=len(c)
-                            if total: print(f"{done*100//total}%",end="\r",flush=True)
-                    print(f"\nDone: {os.path.getsize('/tmp/downloaded.ipa'):,} bytes")
-                    sys.exit(0)
-    print("No itms"); sys.exit(1)
 
 asyncio.run(main())
