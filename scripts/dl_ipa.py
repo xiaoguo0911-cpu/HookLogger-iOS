@@ -24,11 +24,19 @@ async def main():
     itms_url = None
     download_key = None
     base_domain = None
+    all_api_calls = []
 
     async with async_playwright() as p:
         browser = await p.webkit.launch(headless=True)
         context = await browser.new_context(user_agent=UA, viewport={"width": 390, "height": 844})
         page = await context.new_page()
+
+        async def on_request(req):
+            url = req.url
+            # 记录所有 API 调用
+            if "/clientapi/" in url or "api" in url.lower():
+                print(f"[REQ] {req.method} {url}")
+                all_api_calls.append(url)
 
         async def on_response(resp):
             nonlocal ipa_url, plist_url, itms_url, download_key, base_domain
@@ -38,65 +46,80 @@ async def main():
             except Exception:
                 return
 
-            if "getinfo" in url or "app/info" in url:
-                print(f"[getinfo] {url}")
-                print(f"  body: {body[:400]}")
+            # 所有 API 响应都打印
+            if "/clientapi/" in url:
+                print(f"[API {resp.status}] {url}")
+                print(f"  {body[:300]}")
+
+            if "getinfo" in url:
                 try:
                     data = json.loads(body)
                     info = data.get("data", data)
                     download_key = info.get("downloadKey") or info.get("download_key")
-                    print(f"  downloadKey={download_key}")
                     from urllib.parse import urlparse
-                    parsed = urlparse(url)
-                    base_domain = f"{parsed.scheme}://{parsed.netloc}"
+                    base_domain = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+                    print(f"  [downloadKey] {download_key}")
+                    print(f"  [appName] {info.get('name')} v{info.get('version')}")
                 except Exception:
                     pass
 
             if "plist" in url.lower() and resp.status == 200:
-                print(f"[PLIST] {url}")
                 plist_url = url
+                print(f"[PLIST URL] {url}")
 
-            if ".ipa" in url and resp.status in [200, 302]:
-                print(f"[IPA] {url}")
+            if ".ipa" in url:
                 ipa_url = url
+                print(f"[IPA URL] {url}")
 
+            if "itms-services" in url:
+                itms_url = url
+
+        page.on("request", on_request)
         page.on("response", on_response)
 
-        print(f"[*] goto {TARGET}")
+        print(f"[*] 访问 {TARGET}")
         try:
             await page.goto(TARGET, wait_until="networkidle", timeout=60000)
         except Exception as e:
             print(f"[goto] {e}")
 
-        await asyncio.sleep(5)
+        # 等 React 完全渲染
+        print("[*] 等待页面渲染...")
+        await asyncio.sleep(8)
 
-        # 点击下载按钮
-        print("[*] 找下载按钮...")
-        clicked = False
-        for selector in ["button", "a", "[class*='download']", "[class*='btn']"]:
+        # 查找并点击下载按钮
+        print("[*] 查找下载按钮...")
+        for selector in ["button", "a", "[role='button']", "div[onclick]"]:
             try:
                 for el in await page.query_selector_all(selector):
                     text = (await el.inner_text()).strip()
-                    href = await el.get_attribute("href") or ""
-                    if any(w in text for w in ["下载", "安装", "Install", "Download", "获取"]) or "itms" in href:
+                    if any(w in text for w in ["下载", "安装", "Install", "Download", "立即", "获取", "点击"]):
                         print(f"  >> 点击: {text!r}")
                         await el.click()
-                        await asyncio.sleep(3)
-                        clicked = True
-                        break
+                        await asyncio.sleep(5)
             except Exception:
                 pass
-            if clicked:
-                break
 
         await asyncio.sleep(5)
 
-        # 扫描页面内容
+        # 打印所有元素
+        try:
+            all_els = await page.evaluate("""
+                () => Array.from(document.querySelectorAll('*')).filter(e =>
+                    e.children.length == 0 && e.innerText && e.innerText.trim().length > 0 && e.innerText.trim().length < 50
+                ).map(e => e.innerText.trim()).slice(0, 30)
+            """)
+            print(f"[页面文字] {all_els}")
+        except Exception:
+            pass
+
         content = await page.content()
+
+        # 从页面内容搜索
         for pattern, label in [
-            (r'itms-services://[^\s"\'<>]+', "itms"),
-            (r'https?://[^\s"\'<>]+\.plist[^\s"\'<>]*', "plist"),
-            (r'https?://[^\s"\'<>]+\.ipa[^\s"\'<>]*', "ipa"),
+            (r'itms-services://[^\s"\'<>&]+', "itms"),
+            (r'https?://[^\s"\'<>&]+\.plist[^\s"\'<>&]*', "plist"),
+            (r'https?://[^\s"\'<>&]+\.ipa[^\s"\'<>&]*', "ipa"),
         ]:
             matches = re.findall(pattern, content)
             if matches:
@@ -108,63 +131,68 @@ async def main():
                 elif label == "ipa" and not ipa_url:
                     ipa_url = matches[0]
 
-        # 打印所有链接
-        links = await page.evaluate("""
-            () => Array.from(document.querySelectorAll('a,button')).map(e => ({
-                t: e.innerText.trim().substring(0,40), h: e.href||''
-            })).filter(e => e.t || e.h)
-        """)
-        print(f"[links] {links[:8]}")
-
+        print(f"\n[所有API] {all_api_calls}")
+        print(f"[summary] key={download_key} base={base_domain}")
         await browser.close()
 
-    print(f"\n[summary] key={download_key} base={base_domain} plist={plist_url} ipa={ipa_url} itms={itms_url}")
-
-    # 用 downloadKey 试各种下载 API
-    if download_key and base_domain and not ipa_url:
-        for path in [
-            f"/clientapi/app/ipaurl?downloadKey={download_key}",
-            f"/clientapi/ipa/download?key={download_key}",
-            f"/ipa/url?key={download_key}",
-        ]:
+    # 用 downloadKey 枚举可能的 API
+    if download_key and base_domain and not ipa_url and not plist_url:
+        paths = [
+            f"/clientapi/app/download?appid=1cfhnSTQ1T3tLpjtE&downloadKey={download_key}",
+            f"/clientapi/app/downloadipa?downloadKey={download_key}",
+            f"/clientapi/ipa/sign?downloadKey={download_key}",
+            f"/clientapi/ipa/url?downloadKey={download_key}",
+            f"/clientapi/app/installurl?downloadKey={download_key}",
+            f"/clientapi/install?downloadKey={download_key}",
+        ]
+        for path in paths:
             url = base_domain + path
             print(f"[*] 试 {url}")
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": UA})
+                req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": base_domain})
                 with urllib.request.urlopen(req, timeout=10) as r:
                     rb = r.read().decode()
-                print(f"  -> {rb[:200]}")
-                d = json.loads(rb)
-                candidate = d.get("url") or d.get("downloadUrl") or (d.get("data") or {}).get("url")
-                if candidate:
-                    ipa_url = candidate
-                    break
+                print(f"  OK -> {rb[:300]}")
+                try:
+                    d = json.loads(rb)
+                    candidate = d.get("url") or d.get("downloadUrl") or (d.get("data") or {}).get("url")
+                    if candidate:
+                        ipa_url = candidate
+                        break
+                    # 可能直接是 plist
+                    pl = (d.get("data") or {}).get("plistUrl") or d.get("plistUrl")
+                    if pl:
+                        plist_url = pl
+                        break
+                except Exception:
+                    if ".ipa" in rb:
+                        ipa_url = url
+                    elif "plist" in rb:
+                        plist_url = url
             except Exception as e:
                 print(f"  err: {e}")
 
-    # 从 itms 提取 plist
+    # itms -> plist -> IPA
     if itms_url and not ipa_url:
         m = re.search(r'url=([^&\s"\']+)', itms_url)
         if m:
             plist_url = urllib.parse.unquote(m.group(1))
-            print(f"[*] itms plist: {plist_url}")
+            print(f"[plist from itms] {plist_url}")
 
-    # 从 plist 获取 IPA URL
     if plist_url and not ipa_url:
         print(f"[*] 获取 plist: {plist_url}")
         req = urllib.request.Request(plist_url, headers={"User-Agent": UA})
         with urllib.request.urlopen(req, timeout=15) as r:
             plist_xml = r.read().decode()
-        print(f"[plist] {plist_xml[:300]}")
+        print(f"[plist] {plist_xml[:400]}")
         ipa_url = extract_ipa_url(plist_xml)
-        print(f"[IPA URL] {ipa_url}")
 
     if not ipa_url:
-        print("[!] 未能获取 IPA URL")
+        print("[!] 未能获取 IPA URL，请查看上方日志")
         sys.exit(1)
 
+    print(f"[*] 下载 IPA: {ipa_url}")
     out = "/tmp/downloaded.ipa"
-    print(f"[*] 下载 -> {out}")
     req = urllib.request.Request(ipa_url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=300) as r:
         total = int(r.headers.get("Content-Length", 0))
@@ -177,7 +205,7 @@ async def main():
                 f.write(chunk)
                 done += len(chunk)
                 if total:
-                    print(f"  {done*100//total}%", end="\r", flush=True)
+                    print(f"  {done*100//total}% ({done//1024//1024}MB)", end="\r", flush=True)
     size = os.path.getsize(out)
     magic = open(out, "rb").read(4).hex()
     print(f"\n[完成] {size:,} bytes  magic={magic} {'OK' if magic=='504b0304' else 'BAD'}")
