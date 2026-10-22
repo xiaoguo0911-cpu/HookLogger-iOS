@@ -1,59 +1,50 @@
 #!/usr/bin/env python3
 import asyncio, sys, os, json, re
-import urllib.request, urllib.parse
+import urllib.request
 from playwright.async_api import async_playwright
 
 TARGET = "https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy"
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+BASE = "https://doe29x10dqvat.cloudfront.net"
+APPID = "1cfhnSTQ1T3tLpjtE"
 
 async def main():
-    all_resp = {}
-    download_key = None
-
     async with async_playwright() as p:
         browser = await p.webkit.launch(headless=True)
         context = await browser.new_context(user_agent=UA)
-        page = await context.new_page()
 
-        # 拦截所有响应
-        async def on_response(resp):
-            try:
-                body = await resp.text()
-                all_resp[resp.url] = body
-                if 'clientapi' in resp.url:
-                    print(f"API {resp.status} {resp.url}")
-                    print(f"  {body[:300]}")
-            except:
-                pass
-
-        page.on("response", on_response)
-
-        # 注入 XHR 拦截器
+        # 注入 XHR 拦截器到所有页面
         await context.add_init_script("""
+            window.__xhrLog = [];
             const _origOpen = XMLHttpRequest.prototype.open;
             const _origSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url) {
-                this._url = url;
-                this._method = method;
-                console.log('[XHR open]', method, url);
+                this.__xhrUrl = url;
+                this.__xhrMethod = method;
                 return _origOpen.apply(this, arguments);
             };
             XMLHttpRequest.prototype.send = function(body) {
-                console.log('[XHR send]', this._url, body ? body.slice(0,200) : '');
-                this.addEventListener('load', function() {
-                    console.log('[XHR resp]', this._url, this.status, this.responseText ? this.responseText.slice(0,300) : '');
-                });
+                const xhr = this;
+                const url = xhr.__xhrUrl;
+                const origOnLoad = xhr.onload;
+                const origOnReadyStateChange = xhr.onreadystatechange;
+                
+                function captureResp() {
+                    if (xhr.readyState === 4) {
+                        window.__xhrLog.push({
+                            url: url,
+                            status: xhr.status,
+                            resp: xhr.responseText ? xhr.responseText.substring(0, 2000) : ''
+                        });
+                    }
+                }
+                
+                xhr.addEventListener('readystatechange', captureResp);
                 return _origSend.apply(this, arguments);
             };
-            const _origFetch = window.fetch;
-            window.fetch = function(url, opts) {
-                console.log('[fetch]', url, JSON.stringify(opts||{}).slice(0,200));
-                return _origFetch.apply(this, arguments).then(r => {
-                    r.clone().text().then(t => console.log('[fetch resp]', url, r.status, t.slice(0,300)));
-                    return r;
-                });
-            };
         """)
+
+        page = await context.new_page()
 
         print(f"goto {TARGET}")
         try:
@@ -61,49 +52,62 @@ async def main():
         except Exception as e:
             print(f"goto: {e}")
 
-        # 等待页面并监控控制台
-        logs = []
-        page.on("console", lambda m: logs.append(m.text))
+        # 等待 XHR 完成
+        print("waiting 20s for XHR...")
+        await asyncio.sleep(20)
 
-        await asyncio.sleep(15)
-
-        print("\n=== CONSOLE LOGS ===")
-        for log in logs:
-            print(f"  {log}")
-
-        # 从 getinfo 提取 downloadKey
-        for url, body in all_resp.items():
-            if 'getinfo' in url:
+        # 读取所有 XHR 日志
+        xhr_log = await page.evaluate("() => window.__xhrLog || []")
+        print(f"\n=== XHR LOG ({len(xhr_log)}) ===")
+        download_key = None
+        for entry in xhr_log:
+            print(f"[{entry.get('status')}] {entry.get('url')}")
+            resp_text = entry.get('resp', '')
+            if resp_text:
+                print(f"  {resp_text[:300]}")
+            if 'getinfo' in str(entry.get('url', '')) and 'downloadKey' in resp_text:
                 try:
-                    data = json.loads(body)
+                    data = json.loads(resp_text)
                     download_key = data['data']['downloadKey']
-                    print(f"\n[downloadKey] {download_key}")
+                    print(f"  => downloadKey: {download_key}")
                 except:
                     pass
 
         if not download_key:
-            # 从 cookie 或响应中找
-            cookies = await context.cookies()
-            print(f"[cookies] {[c['name']+':'+c['value'][:20] for c in cookies]}")
-            print("[!] 未找到 downloadKey，退出")
+            print("[!] 未找到 downloadKey")
             sys.exit(1)
 
-        # 尝试在页面里直接触发下载
-        print("\n[*] 尝试通过 JS 触发下载...")
-        try:
-            result = await page.evaluate(f"""
+        # 在页面中直接调用下载 API
+        print(f"\n[*] 尝试下载 APIs with downloadKey={download_key}")
+
+        apis = [
+            ("POST", f"{BASE}/clientapi/app/install",
+             json.dumps({"appid": APPID, "downloadKey": download_key, "lang": "zh_CN"})),
+            ("GET", f"{BASE}/clientapi/app/install?appid={APPID}&downloadKey={download_key}", ""),
+            ("POST", f"{BASE}/clientapi/app/getdownload",
+             json.dumps({"appid": APPID, "downloadKey": download_key})),
+            ("GET", f"{BASE}/clientapi/app/getdownload?appid={APPID}&downloadKey={download_key}", ""),
+            ("GET", f"{BASE}/clientapi/app/plist?appid={APPID}&downloadKey={download_key}", ""),
+            ("POST", f"{BASE}/clientapi/app/download",
+             json.dumps({"appid": APPID, "downloadKey": download_key})),
+        ]
+
+        for method, url, body in apis:
+            try:
+                js = f"""
                 async () => {{
-                    const r = await fetch('/clientapi/app/install', {{
-                        method: 'POST',
-                        headers: {{'Content-Type': 'application/json'}},
-                        body: JSON.stringify({{appid: '1cfhnSTQ1T3tLpjtE', downloadKey: '{download_key}', lang: 'zh_CN'}})
-                    }});
-                    return await r.text();
+                    const opts = {{method: '{method}', headers: {{'Content-Type': 'application/json'}}}};
+                    {'opts.body = JSON.stringify(' + json.dumps(json.loads(body)) + ');' if body else ''}
+                    const r = await fetch('{url}', opts);
+                    return {{status: r.status, body: await r.text()}};
                 }}
-            """)
-            print(f"  install result: {result[:300]}")
-        except Exception as e:
-            print(f"  install err: {e}")
+                """
+                result = await page.evaluate(js)
+                print(f"  [{result['status']}] {method} {url}")
+                if result['body']:
+                    print(f"    {result['body'][:300]}")
+            except Exception as e:
+                print(f"  [ERR] {url}: {e}")
 
         await browser.close()
 
