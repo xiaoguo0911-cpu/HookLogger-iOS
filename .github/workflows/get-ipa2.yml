@@ -1,0 +1,70 @@
+name: Get IPA v2
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Target URL'
+        required: true
+        default: 'https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy'
+
+jobs:
+  run:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mitmproxy
+        run: pip3 install mitmproxy --break-system-packages --quiet
+
+      - name: Start mitmproxy
+        run: |
+          mitmdump -p 8080 --save-stream-file /tmp/traffic.mitm --ssl-insecure &
+          echo "MITM_PID=$!" >> $GITHUB_ENV
+          sleep 3
+
+      - name: Boot simulator
+        run: |
+          SIM=$(xcrun simctl list devices available -j | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)['devices']
+          for rt,devs in d.items():
+              if 'iOS' in rt:
+                  for dev in devs:
+                      if 'iPhone' in dev['name'] and dev['isAvailable']:
+                          print(dev['udid']); exit()
+          ")
+          echo "SIM=$SIM" >> $GITHUB_ENV
+          xcrun simctl boot "$SIM" || true
+          sleep 15
+          echo "Booted: $SIM"
+
+      - name: Install mitmproxy CA cert in simulator
+        run: |
+          CERT="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+          ls ~/.mitmproxy/ || true
+          if [ -f "$CERT" ]; then
+            xcrun simctl keychain "$SIM" add-root-cert "$CERT" && echo "CA installed" || true
+          fi
+
+      - name: Open URL in simulator
+        run: |
+          TARGET="${{ github.event.inputs.url || 'https://yjriz.nzctjvr.com/2VHkkYFEvf/vxwmS1ivH7eZWQKy' }}"
+          echo "Opening: $TARGET"
+          xcrun simctl openurl booted "$TARGET"
+          sleep 40
+
+      - name: Analyze traffic and download IPA
+        run: |
+          kill $MITM_PID 2>/dev/null || true
+          sleep 2
+          python3 scripts/dl_mitm.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipa-${{ github.run_number }}
+          path: /tmp/downloaded.ipa
+          retention-days: 7
