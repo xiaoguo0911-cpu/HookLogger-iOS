@@ -15,7 +15,7 @@ async def main():
             Object.defineProperty(navigator,'platform',{get:()=>'iPhone'});
             Object.defineProperty(navigator,'maxTouchPoints',{get:()=>5});
             window.__log=[];
-            window.__navLog=[];
+            window.__decLog=[];  // 解密日志
             const _o=XMLHttpRequest.prototype.open,_s=XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open=function(m,u){this._u=u;return _o.apply(this,arguments)};
             XMLHttpRequest.prototype.send=function(b){
@@ -25,60 +25,82 @@ async def main():
                 });
                 return _s.apply(this,arguments);
             };
-            const _oa=window.location.assign.bind(window.location);
-            window.location.assign=function(u){window.__navLog.push({t:'assign',u});return _oa(u);};
-            window.open=function(u){window.__navLog.push({t:'open',u});return null;};
+            // 拦截所有函数调用，找返回 itms URL 的那个
+            // 重写 String.prototype.startsWith 来检测
+            const _origSW = String.prototype.startsWith;
+            String.prototype.startsWith = function(prefix) {
+                const result = _origSW.call(this, prefix);
+                if(prefix && prefix.includes('itms-services') && this.length > 10) {
+                    window.__decLog.push({
+                        input: this.slice(0, 300),
+                        prefix: prefix,
+                        result: result
+                    });
+                    console.log('[startsWith itms]', this.slice(0, 300), '|', prefix, '|', result);
+                }
+                return result;
+            };
+            // 也拦截 includes 检查 itms
+            const _origInc = String.prototype.includes;
+            String.prototype.includes = function(s) {
+                if(s && s.includes('itms') && this.length > 10) {
+                    window.__decLog.push({type:'includes', str: this.slice(0,300), search: s});
+                }
+                return _origInc.call(this, s);
+            };
         """)
         page = await context.new_page()
 
         async def on_itms(route):
             itms_urls.append(route.request.url)
-            print(f"[ITMS] {route.request.url}")
+            print(f"[ITMS ROUTE] {route.request.url}")
             await route.abort()
         await page.route("itms-services://**", on_itms)
 
         try:
             await page.goto(TARGET, wait_until="load", timeout=30000)
         except: pass
+
         await asyncio.sleep(20)
 
-        # 找并点击"安装"按钮
+        # 找安装按钮并点击
         btns = await page.query_selector_all("button")
-        print(f"buttons: {len(btns)}")
         for btn in btns:
             txt = await btn.inner_text()
-            print(f"  btn: '{txt}'")
-            if '安装' in txt and '前' not in txt and '后' not in txt:
-                print(f"  >> CLICKING: '{txt}'")
+            if '安装' in txt and len(txt) < 5:
+                print(f"Clicking: '{txt}'")
                 await btn.click()
-                await asyncio.sleep(5)
                 break
 
-        # 等待 itms 导航
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)
 
-        nav_log = await page.evaluate("()=>window.__navLog||[]")
+        dec_log = await page.evaluate("()=>window.__decLog||[]")
         xhr = await page.evaluate("()=>window.__log||[]")
-        print(f"navLog: {nav_log}")
+
+        print(f"dec_log: {dec_log[:5]}")
         print(f"itms: {itms_urls}")
 
-        # 新增 XHR
+        # 从 dec_log 找 itms URL
+        for entry in dec_log:
+            s = entry.get('input','') or entry.get('str','')
+            if 'itms-services' in s:
+                itms_url = s
+                print(f"FOUND itms: {itms_url}")
+                itms_urls.append(itms_url)
+
+        # 也找 inhouse 响应
         for e in xhr:
-            if 'inhouse' in e['url'] or 'download' in e['url'].lower():
-                print(f"XHR [{e['status']}] {e['url']}")
-                print(f"  {e['resp'][:200]}")
+            if 'inhouse' in e['url']:
+                print(f"inhouse resp: {e['resp'][:200]}")
 
         await browser.close()
 
-    all_itms = itms_urls + [n['u'] for n in nav_log if 'itms' in str(n.get('u',''))]
-    print(f"all itms: {all_itms}")
-
+    all_itms = [u for u in itms_urls if 'itms-services' in u]
     if all_itms:
         itms = all_itms[0]
         m = re.search(r'url=([^&\s"]+)', itms)
         if m:
             plist_url = urllib.parse.unquote(m.group(1))
-            print(f"plist: {plist_url}")
             r = urllib.request.urlopen(urllib.request.Request(plist_url, headers={"User-Agent": UA}), timeout=15)
             p = plistlib.loads(r.read())
             for a in p.get('items',[{}])[0].get('assets',[]):
@@ -96,6 +118,6 @@ async def main():
                             if total: print(f"{done*100//total}%",end="\r",flush=True)
                     print(f"\nDone: {os.path.getsize('/tmp/downloaded.ipa'):,} bytes")
                     sys.exit(0)
-    print("no itms"); sys.exit(1)
+    print("no itms found"); sys.exit(1)
 
 asyncio.run(main())
