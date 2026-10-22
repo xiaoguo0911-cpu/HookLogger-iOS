@@ -65,7 +65,12 @@ async def main():
             try:
                 body = await resp.text()
             except Exception:
-                return
+                body = ""
+
+            # 打印所有响应
+            print(f"[{resp.status}] {url[:100]}")
+            if resp.status >= 400:
+                print(f"  ERR BODY: {body[:100]}")
 
             if "getinfo" in url:
                 print(f"[getinfo] {url}")
