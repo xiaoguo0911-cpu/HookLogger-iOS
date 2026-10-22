@@ -1,10 +1,28 @@
 #!/usr/bin/env python3
+"""
+直接下载流程：
+1. 访问落地页取 appid
+2. 调 getinfo 取 downloadKey
+3. 调 inhouse 取 itms-services URL（明文，不走浏览器加密）
+4. 解析 plist 取 IPA URL
+5. 下载 IPA
+"""
 import asyncio, sys, os, re, urllib.request, urllib.parse, json
 import xml.etree.ElementTree as ET
 from playwright.async_api import async_playwright
 
 TARGET = os.environ.get("TARGET_URL", "")
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+
+
+def http_get(url, headers=None):
+    h = {"User-Agent": UA}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read().decode("utf-8", "ignore")
+
 
 def extract_ipa_url(plist_xml):
     root = ET.fromstring(plist_xml)
@@ -18,15 +36,10 @@ def extract_ipa_url(plist_xml):
                 return r
     return find_url(root)
 
-async def main():
-    ipa_url = None
-    plist_url = None
-    itms_url = None
-    download_key = None
-    base_domain = None
-    app_id = None
-    captured_opens = []
 
+async def get_download_key_via_playwright(target_url):
+    """用 Playwright 加载页面，获取 base_domain、appid 和 downloadKey"""
+    result = {}
     async with async_playwright() as p:
         browser = await p.webkit.launch(headless=True)
         context = await browser.new_context(
@@ -34,172 +47,101 @@ async def main():
             viewport={"width": 390, "height": 844},
             extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9"},
         )
-
-        # 在页面加载前注入脚本，拦截 window.open 和 location
         await context.add_init_script("""
-            (function() {
-                window.__captured__ = [];
-                const orig_open = window.open;
-                window.open = function(url) {
-                    console.log('[OPEN]' + url);
-                    window.__captured__.push(url);
-                    return orig_open ? orig_open.apply(this, arguments) : null;
-                };
-
-                // 模拟 iOS 环境
+            () => {
                 Object.defineProperty(navigator, 'platform', {get: () => 'iPhone'});
                 Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 5});
-            })();
+            }
         """)
-
         page = await context.new_page()
 
-        # 监听 console 日志
-        page.on("console", lambda msg: (
-            print(f"[JS {msg.type}] {msg.text}") if "[OPEN]" in msg.text or "itms" in msg.text.lower() or "plist" in msg.text.lower() else None
-        ))
-
         async def on_response(resp):
-            nonlocal ipa_url, plist_url, download_key, base_domain, app_id
             url = resp.url
-            try:
-                body = await resp.text()
-            except Exception:
-                body = ""
-
-            # 打印所有响应
-            print(f"[{resp.status}] {url[:100]}")
-            if resp.status >= 400:
-                print(f"  ERR BODY: {body[:100]}")
-
             if "getinfo" in url:
-                print(f"[getinfo] {url}")
                 try:
+                    body = await resp.text()
                     data = json.loads(body)
                     info = data.get("data", data)
-                    download_key = info.get("downloadKey")
+                    result["downloadKey"] = info.get("downloadKey")
                     from urllib.parse import urlparse
                     parsed = urlparse(url)
-                    base_domain = f"{parsed.scheme}://{parsed.netloc}"
-                    m = re.search(r'appid=([^&]+)', url)
+                    result["base"] = f"{parsed.scheme}://{parsed.netloc}"
+                    m = re.search(r"appid=([^&]+)", url)
                     if m:
-                        app_id = m.group(1)
-                    print(f"  downloadKey={download_key}  appid={app_id}")
+                        result["appid"] = m.group(1)
+                    print(f"[getinfo] key={result['downloadKey']}  base={result['base']}  appid={result.get('appid')}")
                 except Exception as e:
-                    print(f"  err: {e}")
-
-            # 关键: inhouse API 直接返回 itms-services URL
-            if "inhouse" in url and resp.status == 200:
-                print(f"[inhouse] {url}")
-                print(f"  body={body[:300]}")
-                try:
-                    data = json.loads(body)
-                    itms_data = data.get("data", "")
-                    if "itms-services" in str(itms_data):
-                        itms_url = itms_data
-                        print(f"  >> ITMS: {itms_url}")
-                except Exception as e:
-                    print(f"  err: {e}")
-
-            if "plist" in url.lower() and resp.status == 200 and len(body) > 100:
-                print(f"[PLIST RESP] {url}")
-                plist_url = url
-
-            if ".ipa" in url:
-                print(f"[IPA RESP] {url}")
-                ipa_url = url
+                    print(f"[getinfo err] {e}")
 
         page.on("response", on_response)
-
-        print(f"[*] 访问 {TARGET}")
         try:
-            await page.goto(TARGET, wait_until="load", timeout=60000)
+            await page.goto(target_url, wait_until="load", timeout=60000)
         except Exception as e:
             print(f"[goto] {e}")
-
-        # 等 React 和 API 完成
-        print("[*] 等待 30s (React + API)...")
-        await asyncio.sleep(30)
-
-        # 读取拦截到的 window.open 调用
-        try:
-            captured_opens = await page.evaluate("() => window.__captured__ || []")
-            print(f"[window.open calls] {captured_opens}")
-            for u in captured_opens:
-                if "itms-services" in u:
-                    itms_url = u
-                    print(f"  >> ITMS: {u}")
-                elif "plist" in u.lower():
-                    plist_url = u
-                    print(f"  >> PLIST: {u}")
-        except Exception as e:
-            print(f"[captured err] {e}")
-
-        # 获取页面文字
-        try:
-            texts = await page.evaluate("""
-                () => Array.from(document.querySelectorAll('*'))
-                    .filter(e => !e.children.length && e.innerText && e.innerText.trim().length > 0 && e.innerText.trim().length < 80)
-                    .map(e => e.innerText.trim()).slice(0, 20)
-            """)
-            print(f"[页面文字] {texts}")
-        except Exception:
-            pass
-
-        # JS 点击所有元素
-        try:
-            count = await page.evaluate("""
-                () => {
-                    let n = 0;
-                    document.querySelectorAll('button,a,[role=button],[onclick]').forEach(el => {
-                        try { el.click(); n++; } catch(e) {}
-                    });
-                    return n;
-                }
-            """)
-            print(f"[JS click] 点击了 {count} 个元素")
-        except Exception:
-            pass
-
-        await asyncio.sleep(5)
-
-        # 再次读取
-        try:
-            captured_opens2 = await page.evaluate("() => window.__captured__ || []")
-            for u in captured_opens2:
-                if u not in captured_opens:
-                    print(f"[新 window.open] {u}")
-                    if "itms-services" in u:
-                        itms_url = u
-        except Exception:
-            pass
-
-        print(f"\n[summary] key={download_key} itms={itms_url} plist={plist_url} ipa={ipa_url}")
+        await asyncio.sleep(10)
         await browser.close()
+    return result
 
-    # 从 itms 提取 plist URL
-    if itms_url and not plist_url:
-        m = re.search(r'url=([^&\s]+)', itms_url)
-        if m:
-            plist_url = urllib.parse.unquote(m.group(1))
-            print(f"[plist from itms] {plist_url}")
 
-    # 从 plist 获取 IPA URL
-    if plist_url and not ipa_url:
-        print(f"[*] 获取 plist: {plist_url}")
-        req = urllib.request.Request(plist_url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            xml_data = r.read().decode()
-        print(f"[plist] {xml_data[:400]}")
-        ipa_url = extract_ipa_url(xml_data)
-        print(f"[IPA URL] {ipa_url}")
+def main():
+    print(f"[*] 目标: {TARGET}")
 
-    if not ipa_url:
-        print("[!] 未获取 IPA URL")
+    # Step 1: 获取 downloadKey
+    print("[*] 获取 downloadKey...")
+    info = asyncio.run(get_download_key_via_playwright(TARGET))
+
+    if not info.get("downloadKey"):
+        print("[!] 未获取 downloadKey")
         sys.exit(1)
 
+    download_key = info["downloadKey"]
+    base = info["base"]
+    appid = info.get("appid", "")
+    print(f"[*] downloadKey={download_key}")
+
+    # Step 2: 调用 inhouse API（curl 方式，返回明文 itms URL）
+    inhouse_url = f"{base}/clientapi/app/inhouse?appid={appid}&k={download_key}&c=&lang=zh_CN&zh=1"
+    print(f"[*] 调 inhouse: {inhouse_url}")
+    body = http_get(inhouse_url)
+    print(f"[inhouse resp] {body[:300]}")
+
+    data = json.loads(body)
+    itms_or_url = data.get("data", "")
+
+    if not itms_or_url:
+        print("[!] inhouse 返回空")
+        sys.exit(1)
+
+    print(f"[inhouse data] {itms_or_url}")
+
+    # Step 3: 从 itms-services 提取 plist URL
+    plist_url = None
+    if "itms-services" in itms_or_url:
+        m = re.search(r"url=([^&\s]+)", itms_or_url)
+        if m:
+            plist_url = urllib.parse.unquote(m.group(1))
+    elif itms_or_url.startswith("http"):
+        plist_url = itms_or_url
+
+    if not plist_url:
+        print("[!] 未获取 plist URL")
+        sys.exit(1)
+
+    print(f"[*] plist URL: {plist_url}")
+    plist_xml = http_get(plist_url)
+    print(f"[plist] {plist_xml[:300]}")
+
+    # Step 4: 从 plist 提取 IPA URL
+    ipa_url = extract_ipa_url(plist_xml)
+    if not ipa_url:
+        print("[!] 未从 plist 提取 IPA URL")
+        sys.exit(1)
+
+    print(f"[*] IPA URL: {ipa_url}")
+
+    # Step 5: 下载 IPA
     out = "/tmp/downloaded.ipa"
-    print(f"\n[*] 下载: {ipa_url}")
+    print(f"[*] 下载 -> {out}")
     req = urllib.request.Request(ipa_url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=300) as r:
         total = int(r.headers.get("Content-Length", 0))
@@ -213,8 +155,10 @@ async def main():
                 done += len(chunk)
                 if total:
                     print(f"  {done*100//total}%  {done//1024//1024}MB/{total//1024//1024}MB", end="\r", flush=True)
+
     size = os.path.getsize(out)
     magic = open(out, "rb").read(4).hex()
     print(f"\n[完成] {size:,} bytes  magic={magic} {'OK' if magic=='504b0304' else 'BAD'}")
 
-asyncio.run(main())
+
+main()
