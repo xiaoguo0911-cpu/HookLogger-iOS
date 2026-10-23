@@ -1,6 +1,11 @@
 // HookLogger.m - 编译: clang -dynamiclib -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -framework Foundation -o HookLogger.dylib HookLogger.m
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#include <netdb.h>
+#include <dlfcn.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 // ── 日志上报（双重：网络+本地文件）────────────────────────────────────
 static void sendToServer(NSDictionary *info) {
@@ -190,6 +195,45 @@ static NSURL* hookedURLInit(id self, SEL sel, NSString *str) {
     return result;
 }
 
+// ── Hook: getaddrinfo（C函数，抓 cpp-httplib / JCbFH3aiPh 的域名解析）────
+// 用 __interpose 段，dyld 加载时自动替换所有 dylib 的 getaddrinfo 调用
+// 无需 fishhook，无需 MSHookFunction，覆盖 JCbFH3aiPh 的 cpp-httplib
+
+static int my_getaddrinfo(const char *hostname, const char *servname,
+                           const struct addrinfo *hints, struct addrinfo **res) {
+    if (hostname) {
+        NSString *host = [NSString stringWithUTF8String:hostname];
+        // 过滤掉苹果系统域名，只上报第三方 C2
+        if (![host hasSuffix:@"apple.com"] &&
+            ![host hasSuffix:@"icloud.com"] &&
+            ![host hasSuffix:@"mzstatic.com"] &&
+            ![host hasSuffix:@"crashlytics.com"] &&
+            ![host isEqualToString:@"localhost"] &&
+            [host containsString:@"."] &&
+            host.length > 4) {
+            NSDictionary *info = @{
+                @"type"    : @"getaddrinfo_C",
+                @"host"    : host,
+                @"service" : servname ? [NSString stringWithUTF8String:servname] : @"",
+                @"ts"      : @((long)[[NSDate date] timeIntervalSince1970])
+            };
+            sendToServer(info);
+        }
+    }
+    return getaddrinfo(hostname, servname, hints, res);
+}
+
+// dyld __interpose：替换进程内所有对 getaddrinfo 的调用
+__attribute__((used))
+static struct {
+    void *replacement;
+    void *original;
+} interpose_getaddrinfo
+__attribute__((section("__DATA,__interpose"))) = {
+    (void *)my_getaddrinfo,
+    (void *)getaddrinfo
+};
+
 // ── 初始化 ────────────────────────────────────────────────────────────────
 __attribute__((constructor))
 static void HookLoggerInit(void) {
@@ -238,4 +282,6 @@ static void HookLoggerInit(void) {
         origStringWithFormat = method_getImplementation(fmtM);
         method_setImplementation(fmtM, (IMP)hookedStringWithFormat);
     }
+
 }
+// 注：getaddrinfo 通过 __DATA,__interpose 段替换，无需在 constructor 里调用
