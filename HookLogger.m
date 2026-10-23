@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <unistd.h>
 
 // ── 日志上报（双重：网络+本地文件）────────────────────────────────────
 static void sendToServer(NSDictionary *info) {
@@ -244,6 +245,104 @@ static struct {
 __attribute__((section("__DATA,__interpose"))) = {
     (void *)my_getaddrinfo,
     (void *)getaddrinfo
+};
+
+// ── Hook: connect()（抓 JCbFH3aiPh/ATHelper 直连IP的情况）────────────────
+static int my_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    // 获取调用方
+    Dl_info dlinfo;
+    const char *caller_name = "";
+    void *retAddr = __builtin_return_address(0);
+    if (dladdr(retAddr, &dlinfo) && dlinfo.dli_fname) {
+        const char *fname = strrchr(dlinfo.dli_fname, '/');
+        caller_name = fname ? fname+1 : dlinfo.dli_fname;
+    }
+
+    BOOL isTarget = (strstr(caller_name, "JCbFH3aiPh") != NULL ||
+                     strstr(caller_name, "libswift_Concurrency") != NULL ||
+                     strstr(caller_name, "ATHelper") != NULL);
+
+    if (isTarget && addr) {
+        char ip_buf[64] = {0};
+        int port = 0;
+        if (addr->sa_family == AF_INET) {
+            struct sockaddr_in *s4 = (struct sockaddr_in *)addr;
+            inet_ntop(AF_INET, &s4->sin_addr, ip_buf, sizeof(ip_buf));
+            port = ntohs(s4->sin_port);
+        } else if (addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)addr;
+            inet_ntop(AF_INET6, &s6->sin6_addr, ip_buf, sizeof(ip_buf));
+            port = ntohs(s6->sin6_port);
+        }
+        if (strlen(ip_buf) > 0) {
+            NSString *caller = [NSString stringWithUTF8String:caller_name];
+            NSString *ipStr  = [NSString stringWithUTF8String:ip_buf];
+            NSDictionary *info = @{
+                @"type"   : @"connect_C",
+                @"ip"     : ipStr,
+                @"port"   : @(port),
+                @"caller" : caller,
+                @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
+            };
+            sendToServer(info);
+        }
+    }
+    return connect(sockfd, addr, addrlen);
+}
+
+__attribute__((used))
+static struct {
+    void *replacement;
+    void *original;
+} interpose_connect
+__attribute__((section("__DATA,__interpose"))) = {
+    (void *)my_connect,
+    (void *)connect
+};
+
+// ── Hook: send()（抓 JCbFH3aiPh 发送的 HTTP 请求内容）──────────────────────
+static ssize_t my_send(int sockfd, const void *buf, size_t len, int flags) {
+    Dl_info dlinfo;
+    const char *caller_name = "";
+    void *retAddr = __builtin_return_address(0);
+    if (dladdr(retAddr, &dlinfo) && dlinfo.dli_fname) {
+        const char *fname = strrchr(dlinfo.dli_fname, '/');
+        caller_name = fname ? fname+1 : dlinfo.dli_fname;
+    }
+
+    BOOL isTarget = (strstr(caller_name, "JCbFH3aiPh") != NULL ||
+                     strstr(caller_name, "ATHelper") != NULL);
+
+    if (isTarget && buf && len > 0 && len < 4096) {
+        // 只抓文本内容（HTTP请求头）
+        const char *data = (const char *)buf;
+        if (data[0] == 'G' || data[0] == 'P' || data[0] == 'H' || data[0] == 'D') {
+            NSString *content = [[NSString alloc] initWithBytes:buf
+                                                         length:MIN(len, 512)
+                                                       encoding:NSUTF8StringEncoding];
+            if (!content) content = @"(binary)";
+            NSString *caller = [NSString stringWithUTF8String:caller_name];
+            NSDictionary *info = @{
+                @"type"    : @"send_C",
+                @"caller"  : caller,
+                @"content" : content,
+                @"len"     : @(len),
+                @"ts"      : @((long)[[NSDate date] timeIntervalSince1970])
+            };
+            sendToServer(info);
+        }
+    }
+    return send(sockfd, buf, len, flags);
+}
+
+__attribute__((used))
+static struct {
+    void *replacement;
+    void *original;
+} interpose_send
+__attribute__((section("__DATA,__interpose"))) = {
+    (void *)my_send,
+    (void *)send
 };
 
 // ── 初始化 ────────────────────────────────────────────────────────────────
