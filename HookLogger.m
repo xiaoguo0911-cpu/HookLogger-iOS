@@ -119,8 +119,7 @@ static id hookedInitWithBytes(id self, SEL sel, const void *bytes, NSUInteger le
         // 检查是否包含 .ga-a9 或 huqwudu
         for (NSUInteger i = 0; i + 5 < len; i++) {
             if ((s[i]=='v' && s[i+1]=='s' && s[i+2]=='d' && s[i+3]=='e' && s[i+4]=='g') ||
-                (s[i]=='c' && s[i+1]=='h' && s[i+2]=='s' && s[i+3]=='k' && s[i+4]=='t') ||
-                ) {
+                (s[i]=='c' && s[i+1]=='h' && s[i+2]=='s' && s[i+3]=='k' && s[i+4]=='t')) {
                 NSDictionary *info = @{
                     @"type"  : @"initWithBytes",
                     @"str"   : result ? [result description] : @"nil",
