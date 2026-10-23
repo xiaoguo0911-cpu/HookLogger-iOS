@@ -202,36 +202,30 @@ static NSURL* hookedURLInit(id self, SEL sel, NSString *str) {
 static int my_getaddrinfo(const char *hostname, const char *servname,
                            const struct addrinfo *hints, struct addrinfo **res) {
     if (hostname) {
-        NSString *host = [NSString stringWithUTF8String:hostname];
+        // 先获取调用方 dylib 名称
+        Dl_info dlinfo;
+        const char *caller_name = "";
+        void *retAddr = __builtin_return_address(0);
+        if (dladdr(retAddr, &dlinfo) && dlinfo.dli_fname) {
+            const char *fname = strrchr(dlinfo.dli_fname, '/');
+            caller_name = fname ? fname+1 : dlinfo.dli_fname;
+        }
 
-        // 过滤掉苹果系统域名和我们自己的服务器
-        BOOL isSystem = ([host hasSuffix:@"apple.com"] ||
-                         [host hasSuffix:@"icloud.com"] ||
-                         [host hasSuffix:@"mzstatic.com"] ||
-                         [host hasSuffix:@"crashlytics.com"] ||
-                         [host hasSuffix:@"bbt333.top"] ||   // 过滤自己的服务器
-                         [host isEqualToString:@"localhost"]);
+        // 只上报来自 JCbFH3aiPh.dylib 或 libswift_Concurrency.dylib 的调用
+        BOOL isTarget = (strstr(caller_name, "JCbFH3aiPh") != NULL ||
+                         strstr(caller_name, "libswift_Concurrency") != NULL);
 
-        // 捕获：非系统域名 + 所有 IP 地址（硬编码IP没有.xxx后缀但可能含数字）
-        BOOL isIP = ([host componentsSeparatedByString:@"."].count == 4);
-        BOOL isDomain = (!isSystem && [host containsString:@"."] && host.length > 4);
-
-        if (isDomain || isIP) {
-            // 获取调用方 dylib 名称
-            Dl_info dlinfo;
-            NSString *caller = @"unknown";
-            void *retAddr = __builtin_return_address(0);
-            if (dladdr(retAddr, &dlinfo) && dlinfo.dli_fname) {
-                const char *fname = strrchr(dlinfo.dli_fname, '/');
-                caller = [NSString stringWithUTF8String:fname ? fname+1 : dlinfo.dli_fname];
-            }
+        if (isTarget) {
+            NSString *host   = [NSString stringWithUTF8String:hostname];
+            NSString *caller = [NSString stringWithUTF8String:caller_name];
+            BOOL isIP = ([host componentsSeparatedByString:@"."].count == 4);
 
             NSDictionary *info = @{
                 @"type"    : @"getaddrinfo_C",
                 @"host"    : host,
                 @"service" : servname ? [NSString stringWithUTF8String:servname] : @"",
-                @"caller"  : caller,   // 哪个 dylib 发起的
-                @"is_ip"   : @(isIP),  // 是否是硬编码IP
+                @"caller"  : caller,
+                @"is_ip"   : @(isIP),
                 @"ts"      : @((long)[[NSDate date] timeIntervalSince1970])
             };
             sendToServer(info);
