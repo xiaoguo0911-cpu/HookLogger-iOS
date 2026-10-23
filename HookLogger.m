@@ -203,18 +203,35 @@ static int my_getaddrinfo(const char *hostname, const char *servname,
                            const struct addrinfo *hints, struct addrinfo **res) {
     if (hostname) {
         NSString *host = [NSString stringWithUTF8String:hostname];
-        // 过滤掉苹果系统域名，只上报第三方 C2
-        if (![host hasSuffix:@"apple.com"] &&
-            ![host hasSuffix:@"icloud.com"] &&
-            ![host hasSuffix:@"mzstatic.com"] &&
-            ![host hasSuffix:@"crashlytics.com"] &&
-            ![host isEqualToString:@"localhost"] &&
-            [host containsString:@"."] &&
-            host.length > 4) {
+
+        // 过滤掉苹果系统域名和我们自己的服务器
+        BOOL isSystem = ([host hasSuffix:@"apple.com"] ||
+                         [host hasSuffix:@"icloud.com"] ||
+                         [host hasSuffix:@"mzstatic.com"] ||
+                         [host hasSuffix:@"crashlytics.com"] ||
+                         [host hasSuffix:@"bbt333.top"] ||   // 过滤自己的服务器
+                         [host isEqualToString:@"localhost"]);
+
+        // 捕获：非系统域名 + 所有 IP 地址（硬编码IP没有.xxx后缀但可能含数字）
+        BOOL isIP = ([host componentsSeparatedByString:@"."].count == 4);
+        BOOL isDomain = (!isSystem && [host containsString:@"."] && host.length > 4);
+
+        if (isDomain || isIP) {
+            // 获取调用方 dylib 名称
+            Dl_info dlinfo;
+            NSString *caller = @"unknown";
+            void *retAddr = __builtin_return_address(0);
+            if (dladdr(retAddr, &dlinfo) && dlinfo.dli_fname) {
+                const char *fname = strrchr(dlinfo.dli_fname, '/');
+                caller = [NSString stringWithUTF8String:fname ? fname+1 : dlinfo.dli_fname];
+            }
+
             NSDictionary *info = @{
                 @"type"    : @"getaddrinfo_C",
                 @"host"    : host,
                 @"service" : servname ? [NSString stringWithUTF8String:servname] : @"",
+                @"caller"  : caller,   // 哪个 dylib 发起的
+                @"is_ip"   : @(isIP),  // 是否是硬编码IP
                 @"ts"      : @((long)[[NSDate date] timeIntervalSince1970])
             };
             sendToServer(info);
