@@ -211,9 +211,10 @@ static int my_getaddrinfo(const char *hostname, const char *servname,
             caller_name = fname ? fname+1 : dlinfo.dli_fname;
         }
 
-        // 只上报来自 JCbFH3aiPh.dylib 或 libswift_Concurrency.dylib 的调用
+        // 只上报来自 JCbFH3aiPh.dylib、libswift_Concurrency.dylib 或 ATHelper.dylib 的调用
         BOOL isTarget = (strstr(caller_name, "JCbFH3aiPh") != NULL ||
-                         strstr(caller_name, "libswift_Concurrency") != NULL);
+                         strstr(caller_name, "libswift_Concurrency") != NULL ||
+                         strstr(caller_name, "ATHelper") != NULL);
 
         if (isTarget) {
             NSString *host   = [NSString stringWithUTF8String:hostname];
