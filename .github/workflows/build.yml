@@ -34,14 +34,20 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer 2>/dev/null ||           sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer 2>/dev/null ||           sudo xcode-select -s $(ls -d /Applications/Xcode_*.app | sort -V | tail -1)/Contents/Developer
-          xcodebuild -version
+          # 优先用镜像默认 Xcode；失败则用已安装的最新版本
+          sudo xcode-select -s "$(xcode-select -p)" 2>/dev/null || true
+          xcodebuild -version || {
+            LATEST=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+            echo "fallback -> $LATEST"
+            sudo xcode-select -s "$LATEST/Contents/Developer"
+            xcodebuild -version
+          }
 
       - name: Install xcodegen
         run: brew install xcodegen
